@@ -488,6 +488,7 @@ export class Format extends BasicEffect implements Readonly<BasicEffect> {
 	}) => string[] | void;
 	declare readonly section?: string;
 	declare readonly column?: number;
+	declare readonly timeline?: boolean;
 
 	constructor(data: AnyObject) {
 		super(data);

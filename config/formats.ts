@@ -48,6 +48,32 @@ export const Formats: import('../sim/dex-formats').FormatList = [
 		section: "S/V Singles",
 	},
 	{
+		name: "[Gen 9] OU Timeline",
+		mod: 'gen9',
+		timeline: true,  // ← NEW: enables timeline branching
+		ruleset: ['Standard', 'Evasion Abilities Clause', 'Sleep Moves Clause', '!Sleep Clause Mod'],
+	},
+	{
+		name: "[Gen 9] National Dex Timeline",
+		mod: 'gen9',
+		timeline: true,  // ← NEW: enables timeline branching
+		ruleset: ['Standard NatDex', 'Sleep Moves Clause', '!Sleep Clause Mod'],
+	},
+	{
+		name: "[Gen 9] FFA Timeline",
+		mod: 'gen9',
+		gameType: 'freeforall',
+		timeline: true,  // ← NEW: enables timeline branching
+		ruleset: ['Standard NatDex', 'Sleep Moves Clause', '!Sleep Clause Mod'],
+	},
+	{
+		name: "[Gen 9] Random National Dex Timeline",
+		mod: 'gen9',
+		team: 'random',
+		timeline: true,  // ← NEW: enables timeline branching
+		ruleset: ['Standard NatDex', 'Sleep Moves Clause', '!Sleep Clause Mod'],
+	},
+	{
 		name: "[Gen 9] Random Battle",
 		desc: `Randomized teams of Pok&eacute;mon with sets that are generated to be competitively viable.`,
 		mod: 'gen9',

@@ -15,6 +15,18 @@ const copyOverDataJSON = (file = 'data') => {
 	}
 };
 
+const copyDirSync = (src, dest) => {
+    if (!fs.existsSync(src)) return;
+    fs.mkdirSync(dest, { recursive: true });
+    const entries = fs.readdirSync(src, { withFileTypes: true });
+    for (const entry of entries) {
+        const srcPath = `${src}/${entry.name}`;
+        const destPath = `${dest}/${entry.name}`;
+        if (entry.isDirectory()) copyDirSync(srcPath, destPath);
+        else fs.copyFileSync(srcPath, destPath);
+    }
+};
+
 const shouldBeCompiled = file => {
 	if (file.includes('node_modules/')) return false;
 	if (file.endsWith('.tsx')) return true;
@@ -52,6 +64,10 @@ exports.transpile = decl => {
 	});
 	fs.copyFileSync('./config/config-example.js', './dist/config/config-example.js');
 	copyOverDataJSON();
+
+	// Ensure game-logic JS files are available in dist so runtime requires
+	// like require('../game-logic/MultiBattleManager') succeed.
+	copyDirSync('game-logic', 'dist/game-logic');
 
 	// NOTE: replace is asynchronous - add additional replacements for the same path in one call instead of making multiple calls.
 	if (decl) {

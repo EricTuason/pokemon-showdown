@@ -65,8 +65,8 @@ class MultiBattleManager {
 
 	// ── timeline wiring ─────────────────────────────────────
 	/**
-	 * Allocate a Timeline in *match*, create its Battle instance,
-	 * and set both players from the match's stored teams.
+	 * Allocate a Timeline in *match* and create its Battle instance.
+	 * Teams will be set later via the stream's >player commands.
 	 * Caller is responsible for init / state-stamp / snapshot.
 	 */
 	_wireTimeline(match, parentNum = null, fromTurn = null) {
@@ -81,15 +81,7 @@ class MultiBattleManager {
 			},
 		});
 
-		for (const sideId of ['p1', 'p2']) {
-			let team = match.originalTeams[sideId].team;
-			if (Array.isArray(team)) team = Teams.pack(team.map(ensureSet));
-			timeline.battle.setPlayer(sideId, {
-				name: match.originalTeams[sideId].name,
-				team,
-			});
-		}
-
+		// Note: setPlayer will be called by the stream when >player commands are received
 		return timeline;
 	}
 
@@ -314,6 +306,13 @@ class MultiBattleManager {
 		if (!pokemon || pokemon.fainted)
 			return { success: false, error: 'No active Pokémon to transfer' };
 
+		// ── CRITICAL: Prevent transferring the last Pokémon ──
+		// Count non-fainted Pokémon on this side
+		const nonFaintedCount = sideObj.pokemon.filter(p => !p.fainted).length;
+		if (nonFaintedCount <= 1) {
+			return { success: false, error: 'Cannot transfer your last Pokémon' };
+		}
+
 		const pokemonState = this._capturePokemonState(pokemon);
 		pokemonState.sourceTurn        = battle.turn;
 		pokemonState.sourceTimelineNum = srcTL.num;
@@ -402,18 +401,23 @@ class MultiBattleManager {
 			// remove each pokemon from the source timeline
 			for (const t of group) {
 				const sideObj = battle[t.side];
+				// ── BUGFIX: Capture pokemon reference BEFORE modifying active ──
 				const pokemon = sideObj.active[0];
 				if (!pokemon || pokemon.fainted) continue;
 
-				battle.add('-message', `${pokemon.name} traveled to ${t.targetCoord}!`);
-				pokemon.fainted     = true;
-				pokemon.faintQueued = true;
-				pokemon.hp          = 0;
-				pokemon.isActive    = false;
-				pokemon.status      = 'fnt';
-				sideObj.pokemonLeft--;
-				sideObj.active[0]   = null;
+				// ── Store pokemon reference in transfer for later use ──
+				t.sourcePokeIdForLogging = pokemon.name;
 
+				// announce and remove the pokemon from the source team without marking it fainted
+				battle.add('-message', `${pokemon.name} traveled to ${t.targetCoord}!`);
+				const idx = sideObj.pokemon.indexOf(pokemon);
+				if (idx !== -1) sideObj.pokemon.splice(idx, 1);
+				// reflect removal in counters
+				sideObj.pokemonLeft--;
+				// clear the active slot
+				sideObj.active[0] = null;
+
+				// bring a bench Pokémon forward if available
 				const bench = sideObj.pokemon.find(p => !p.isActive && !p.fainted);
 				if (bench) {
 					sideObj.pokemon.splice(sideObj.pokemon.indexOf(bench), 1);

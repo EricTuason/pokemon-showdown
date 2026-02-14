@@ -76,8 +76,7 @@ class MultiTimeBattle {
 	}
 
 	get battle() {
-		if (!this.currentTimeline) return null;
-		return this.currentTimeline.battle;
+		return this.currentTimeline?.battle ?? null;
 	}
 
 	get turn(): number {
@@ -115,14 +114,33 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 	replay: boolean | 'spectator';
 	keepAlive: boolean;
 	battle: MultiTimeBattle | null;
-	private manager: any;
+	private manager: MultiBattleManager;
 	private matchId: string | null;
 	private rootTimelineId: string = '';
 
+	/**
+	 * Maps room-facing IDs to internal battle IDs registered with the manager.
+	 * This is the SINGLE SOURCE OF TRUTH for ID resolution.
+	 */
+	readonly managedBattleIds: Map<string, string> = new Map();
+
+	// Track timeline relationships ourselves since the manager doesn't
+	private timelineRegistry: Map<string, {
+		battleId: string;
+		num: number;
+		parentNum: number | null;
+		fromTurn: number | null;
+		globalId: string;
+	}> = new Map();
+	private timelineCounter = 0;
+
 	constructor(
-		manager: any,
+		manager: MultiBattleManager,
 		options: {
-			debug?: boolean, noCatch?: boolean, keepAlive?: boolean, replay?: boolean | 'spectator',
+			debug?: boolean;
+			noCatch?: boolean;
+			keepAlive?: boolean;
+			replay?: boolean | 'spectator';
 		} = {}
 	) {
 		super();
@@ -149,25 +167,104 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 		}
 		const history = this.turnSnapshots.get(timelineId)!;
 
-		// Always overwrite current turn (state may have changed mid-turn)
 		history.set(turn, {
 			p1Active: extractPokemonSnapshot(battle.sides?.[0]?.active?.[0] ?? null),
 			p2Active: extractPokemonSnapshot(battle.sides?.[1]?.active?.[0] ?? null),
 		});
 	}
 
-	/** Hook a timeline's battle.send to capture snapshots and emit tree updates */
-	private hookBattleSend(timeline: any) {
-		const battle = timeline.battle;
+	/**
+	 * The room ID IS the match ID. No suffix, no transformation.
+	 * This is the canonical ID used everywhere.
+	 */
+	private getRootBattleId(): string {
+		return this.matchId!;
+	}
+
+	/**
+	 * Generate a branch battle ID that is deterministic and traceable.
+	 * Format: "{matchId}>>branch{N}" so it's clear it belongs to this match.
+	 */
+	private getBranchBattleId(): string {
+		return `${this.matchId}>>branch${this.timelineCounter + 1}`;
+	}
+
+	/**
+	 * Generate a unique timeline ID within this match.
+	 * For the root, this equals the matchId. For branches, includes the branch suffix.
+	 */
+	private generateTimelineId(battleId: string): string {
+		return battleId;
+	}
+
+	/**
+	 * Resolve any ID (room-facing or internal) to the manager's registered battle ID.
+	 * Checks the mapping first, then falls back to direct lookup.
+	 */
+	resolveManagerBattleId(roomOrTimelineId: string): string | null {
+		// Direct hit in our mapping
+		if (this.managedBattleIds.has(roomOrTimelineId)) {
+			return this.managedBattleIds.get(roomOrTimelineId)!;
+		}
+		// Maybe it's already a manager ID
+		if (this.manager.getBattle(roomOrTimelineId)) {
+			return roomOrTimelineId;
+		}
+		// Check timeline registry
+		for (const [globalId, entry] of this.timelineRegistry) {
+			if (entry.battleId === roomOrTimelineId) return entry.battleId;
+			if (globalId === roomOrTimelineId) return entry.battleId;
+		}
+		return null;
+	}
+
+	/**
+	 * Register a timeline (battle) in our local tracking
+	 */
+	private registerTimeline(
+		battleId: string,
+		parentNum: number | null = null,
+		fromTurn: number | null = null
+	) {
+		this.timelineCounter++;
+		const globalId = this.generateTimelineId(battleId);
+		this.timelineRegistry.set(globalId, {
+			battleId,
+			num: this.timelineCounter,
+			parentNum,
+			fromTurn,
+			globalId,
+		});
+
+		// Register the bidirectional mapping:
+		// roomId -> managerBattleId AND managerBattleId -> managerBattleId
+		this.managedBattleIds.set(globalId, battleId);
+		this.managedBattleIds.set(battleId, battleId);
+
+		console.log(`[TIMELINE DEBUG] Registered timeline: globalId="${globalId}", battleId="${battleId}" (num=${this.timelineCounter}, parent=${parentNum}, fromTurn=${fromTurn})`);
+
+		return this.timelineRegistry.get(globalId)!;
+	}
+
+	/**
+	 * Get the Battle object for a timeline ID
+	 */
+	private getTimelineBattle(globalId: string): any | null {
+		const entry = this.timelineRegistry.get(globalId);
+		if (!entry) return null;
+		return this.manager.getBattle(entry.battleId) || null;
+	}
+
+	/** Hook a battle's send to capture snapshots and emit tree updates */
+	private hookBattleSend(globalId: string, battle: any) {
 		if (!battle) return;
-		const tlId = timeline.globalId;
 
 		battle.send = (sendType: string, data: any) => {
 			if (Array.isArray(data)) data = data.join('\n');
 			this.pushMessage(sendType, data);
 
 			if (sendType === 'update') {
-				this.captureSnapshot(tlId, battle);
+				this.captureSnapshot(globalId, battle);
 				this.emitTimelineUpdate();
 			}
 		};
@@ -191,7 +288,6 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 			}
 		}
 
-		// Call sendUpdates to flush any pending battle messages
 		if (this.battle) {
 			this.battle.sendUpdates();
 		}
@@ -210,64 +306,115 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 		this.push(`${type}\n${data}`);
 	}
 
+	public override pushError(err: any, recoverable: boolean) {
+		if (recoverable) {
+			this.pushMessage('update',
+				`|html|<div class="broadcast-red"><b>The battle crashed</b></div>`);
+		}
+		this.pushMessage('error', err.stack || err.message || String(err));
+	}
+
 	private _writeLine(type: string, message: string) {
 		switch (type) {
 		case 'start': {
 			const options = JSON.parse(message);
-			const { match, timeline } = this.manager.createMatch({
+
+			// The room ID IS the match ID. Period.
+			this.matchId = options.roomid || `match-${Date.now()}`;
+
+			console.log(`[TIMELINE DEBUG] Starting match: ${this.matchId}`);
+			console.log(`[TIMELINE DEBUG] Format: ${options.formatid}`);
+
+			// Root battle ID = match ID. No suffix.
+			const rootBattleId = this.getRootBattleId();
+
+			const battle = this.manager.createBattle(rootBattleId, {
 				formatid: options.formatid,
-				p1: { name: 'Player 1', team: null },
-				p2: { name: 'Player 2', team: null },
+				seed: options.seed,
+				debug: this.debug,
 			});
-			this.matchId = match.id;
+
+			// Register: globalId = battleId = matchId for root
+			const timeline = this.registerTimeline(rootBattleId);
 			this.rootTimelineId = timeline.globalId;
 
+			// Also register the raw roomid -> manager battle ID mapping
+			// so room-battle.ts can find it by this.roomid
+			if (options.roomid && options.roomid !== rootBattleId) {
+				this.managedBattleIds.set(options.roomid, rootBattleId);
+			}
+
+			// Set up the MultiTimeBattle wrapper
+			if (!this.matchId) {
+				throw new Error('Failed to determine match ID');
+			}
 			if (!this.battle) {
-				this.battle = new MultiTimeBattle(this.manager, match.id);
+				this.battle = new MultiTimeBattle(this.manager, this.matchId);
 			}
 			this.battle.currentTimelineId = timeline.globalId;
-			this.battle.currentTimeline = timeline;
+			this.battle.currentTimeline = {
+				...timeline,
+				battle,
+			};
 
 			// Hook send callback to capture snapshots and relay messages
-			this.hookBattleSend(timeline);
+			this.hookBattleSend(timeline.globalId, battle);
 
-			// Initial tree state (may have no Pokémon data yet)
+			// Initial tree state
 			this.emitTimelineUpdate();
 			break;
 		}
 		case 'player': {
-			// >player p1 {"name":"Alice","team":"...packed team..."}
 			const [slot, playerJson] = splitFirst(message, ' ');
 			const playerData = JSON.parse(playerJson);
 
-			if (!this.matchId) throw new Error('No active match');
-			const parsed = this.manager.parseGlobalId(this.rootTimelineId);
-			if (!parsed) throw new Error('Root timeline lost');
+			if (!this.battle || !this.battle.currentTimeline) {
+				throw new Error('No active match');
+			}
 
-			const timeline = parsed.timeline;
-			const battle = timeline.battle;
-			
-			// Use the battle's setPlayer method to apply the player data and team
-			battle.setPlayer(slot as any, playerData);
+			const battle = this.battle.currentTimeline.battle;
+			if (!battle) throw new Error('No battle in current timeline');
+
+			console.log(`[TIMELINE DEBUG] Setting player ${slot}: ${playerData.name}`);
+
+			const entry = this.timelineRegistry.get(this.battle.currentTimelineId);
+			if (entry) {
+				this.manager.setPlayer(entry.battleId, slot as any, {
+					name: playerData.name,
+					team: playerData.team,
+					avatar: playerData.avatar,
+				});
+			} else {
+				battle.setPlayer(slot as any, playerData);
+			}
 			break;
 		}
 		case 'p1':
 		case 'p2':
 		case 'p3':
 		case 'p4': {
-			// >p1 move 1  or  >p2 switch 2
-			if (!this.battle || !this.battle.currentTimeline) throw new Error('No active timeline');
+			if (!this.battle || !this.battle.currentTimeline) {
+				throw new Error('No active timeline');
+			}
 
-			const sideId = type as any;
-			const timeline = this.battle.currentTimeline;
-			const battle = timeline.battle;
+			const sideId = type as 'p1' | 'p2' | 'p3' | 'p4';
+			const entry = this.timelineRegistry.get(this.battle.currentTimelineId);
 
-			// Submit the choice via the manager
-			const result = this.manager.submitChoice(timeline.globalId, sideId, message);
+			if (!entry) {
+				throw new Error(`Timeline ${this.battle.currentTimelineId} not registered`);
+			}
 
-			if (result !== true) {
-				// On error, emit as sideupdate with error message
-				this.pushMessage('sideupdate', `${sideId}\n|error|${result}`);
+			console.log(`[TIMELINE DEBUG] Choice: ${sideId} ${message} (battle: ${entry.battleId})`);
+
+			try {
+				const result = this.manager.choose(entry.battleId, sideId, message);
+				if (result === false) {
+					this.pushMessage('sideupdate',
+						`${sideId}\n|error|[Invalid choice] ${message}`);
+				}
+			} catch (err: any) {
+				this.pushMessage('sideupdate',
+					`${sideId}\n|error|[Invalid choice] ${err.message}`);
 			}
 			break;
 		}
@@ -275,37 +422,69 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 			if (!this.battle || !this.matchId) throw new Error('No active match');
 			const turn = parseInt(message.trim()) || 0;
 
-			const result = this.manager.branchTimeline(
-				this.battle.currentTimelineId, turn
-			);
-			if (!result || result.error) {
-				this.pushMessage('update', `|error|${result?.error || 'Failed to branch'}`);
+			console.log(`[TIMELINE DEBUG] Branching from ${this.battle.currentTimelineId} at turn ${turn}`);
+
+			const currentEntry = this.timelineRegistry.get(this.battle.currentTimelineId);
+			if (!currentEntry) {
+				this.pushMessage('update', `|error|Current timeline not found`);
 				break;
 			}
-			const newTimeline = result.timeline;
 
-			// Copy parent snapshots up to the branch turn into the new timeline
-			const parentHistory = this.turnSnapshots.get(this.battle.currentTimelineId);
-			if (parentHistory) {
-				const newHistory = new Map<number, {
-					p1Active: PokemonSnapshot | null;
-					p2Active: PokemonSnapshot | null;
-				}>();
-				for (const [t, snap] of parentHistory) {
-					if (t <= turn) newHistory.set(t, { ...snap });
-				}
-				this.turnSnapshots.set(newTimeline.globalId, newHistory);
+			const currentBattle = this.manager.getBattle(currentEntry.battleId);
+			if (!currentBattle) {
+				this.pushMessage('update', `|error|Current battle not found`);
+				break;
 			}
 
-			this.hookBattleSend(newTimeline);
+			// Deterministic branch ID
+			const newBattleId = this.getBranchBattleId();
 
-			// Auto-switch to the new branch
-			this.battle.currentTimelineId = newTimeline.globalId;
-			this.battle.currentTimeline = newTimeline;
+			try {
+				const newBattle = this.manager.createBattle(newBattleId, {
+					formatid: currentBattle.format?.id || currentBattle.formatid,
+					debug: this.debug,
+				});
 
-			this.pushMessage('update',
-				`|-message|Branched timeline #${newTimeline.num} from turn ${turn}`);
-			this.emitTimelineUpdate();
+				// Link the battles in the manager
+				this.manager.linkBattles(currentEntry.battleId, newBattleId);
+
+				// Register the new timeline
+				const newTimeline = this.registerTimeline(
+					newBattleId,
+					currentEntry.num,
+					turn
+				);
+
+				// Copy parent snapshots up to the branch turn
+				const parentHistory = this.turnSnapshots.get(this.battle.currentTimelineId);
+				if (parentHistory) {
+					const newHistory = new Map<number, {
+						p1Active: PokemonSnapshot | null;
+						p2Active: PokemonSnapshot | null;
+					}>();
+					for (const [t, snap] of parentHistory) {
+						if (t <= turn) newHistory.set(t, { ...snap });
+					}
+					this.turnSnapshots.set(newTimeline.globalId, newHistory);
+				}
+
+				// Hook the new battle's send
+				this.hookBattleSend(newTimeline.globalId, newBattle);
+
+				// Switch to the new branch
+				this.battle.currentTimelineId = newTimeline.globalId;
+				this.battle.currentTimeline = {
+					...newTimeline,
+					battle: newBattle,
+				};
+
+				this.pushMessage('update',
+					`|-message|Branched timeline #${newTimeline.num} from turn ${turn}`);
+				this.emitTimelineUpdate();
+			} catch (err: any) {
+				this.pushMessage('update', `|error|Failed to branch: ${err.message}`);
+				console.log(`[TIMELINE DEBUG] Branch error:`, err);
+			}
 			break;
 		}
 		}
@@ -314,30 +493,24 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 	private _getTimelineNodes(): { nodes: TimelineNodeData[] } {
 		if (!this.matchId) return { nodes: [] };
 
-		const match = this.manager.matches.get(this.matchId);
-		if (!match) return { nodes: [] };
-
 		const allNodes: TimelineNodeData[] = [];
 
-		for (const [, timeline] of match.timelines) {
-			const tlId = timeline.globalId;
-			const battle = timeline.battle;
+		for (const [globalId, entry] of this.timelineRegistry) {
+			const battle = this.manager.getBattle(entry.battleId);
 			const currentTurn = battle?.turn ?? 0;
 
-			// Make sure we have a snapshot of the current state
-			if (battle) this.captureSnapshot(tlId, battle);
+			if (battle) this.captureSnapshot(globalId, battle);
 
-			const history = this.turnSnapshots.get(tlId);
+			const history = this.turnSnapshots.get(globalId);
 			if (!history || history.size === 0) {
-				// No history yet — emit at least one node at turn 0
 				allNodes.push({
-					timelineId: tlId,
-					timelineNum: timeline.num || 1,
+					timelineId: globalId,
+					timelineNum: entry.num,
 					turn: 0,
-					parentTimelineId: timeline.parentNum
-						? `${match.id}:${timeline.parentNum}` : null,
-					branchTurn: timeline.fromTurn ?? null,
-					isCurrent: this.battle?.currentTimelineId === tlId,
+					parentTimelineId: entry.parentNum
+						? this.findGlobalIdByNum(entry.parentNum) : null,
+					branchTurn: entry.fromTurn,
+					isCurrent: this.battle?.currentTimelineId === globalId,
 					ended: battle?.ended ?? false,
 					p1Active: null,
 					p2Active: null,
@@ -345,26 +518,17 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 				continue;
 			}
 
-			// Build parent timeline's global ID
-			let parentTlId: string | null = null;
-			if (timeline.parentNum) {
-				// Find the parent timeline's global ID by its num
-				for (const [, ptl] of match.timelines) {
-					if (ptl.num === timeline.parentNum) {
-						parentTlId = ptl.globalId;
-						break;
-					}
-				}
-			}
+			const parentGlobalId = entry.parentNum
+				? this.findGlobalIdByNum(entry.parentNum) : null;
 
 			for (const [turn, snap] of history) {
 				allNodes.push({
-					timelineId: tlId,
-					timelineNum: timeline.num || 1,
+					timelineId: globalId,
+					timelineNum: entry.num,
 					turn,
-					parentTimelineId: parentTlId,
-					branchTurn: timeline.fromTurn ?? null,
-					isCurrent: this.battle?.currentTimelineId === tlId
+					parentTimelineId: parentGlobalId,
+					branchTurn: entry.fromTurn,
+					isCurrent: this.battle?.currentTimelineId === globalId
 						&& turn === currentTurn,
 					ended: battle?.ended ?? false,
 					p1Active: snap.p1Active,
@@ -374,5 +538,15 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 		}
 
 		return { nodes: allNodes };
+	}
+
+	/**
+	 * Find a timeline's global ID by its number
+	 */
+	private findGlobalIdByNum(num: number): string | null {
+		for (const [globalId, entry] of this.timelineRegistry) {
+			if (entry.num === num) return globalId;
+		}
+		return null;
 	}
 }

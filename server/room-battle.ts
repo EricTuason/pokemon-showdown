@@ -15,6 +15,7 @@ import { execSync } from "child_process";
 import { ProcessManager, type Streams, Utils } from '../lib';
 import { BattleStream } from "../sim/battle-stream";
 import { MultiTimeBattleStream } from "../sim/multi-battle-stream";
+import { MultiBattleManager } from "../sim/multi-battle-manager"
 import { RoomGamePlayer, RoomGame } from "./room-game";
 import * as ConfigLoader from './config-loader';
 import type { Tournament } from './tournaments/index';
@@ -561,22 +562,20 @@ export class RoomBattle extends RoomGame<RoomBattlePlayer> {
 		this.playerCap = format.playerCount;
 
 		const fmt = Dex.formats.get(options.format, true);
-			if (fmt.timeline) {
-				// Lazily construct a shared manager for timeline battles.
-				// eslint-disable-next-line @typescript-eslint/no-var-requires
-				if (!(global as any).__MULTI_BATTLE_MANAGER) {
-					// require the JS manager implementation. Resolve via __dirname so
-					// the compiled `dist/server` file will locate the project-root copy
-					// in `../game-logic/` regardless of where Node is run from.
-					// eslint-disable-next-line @typescript-eslint/no-var-requires
-					const _path = require('path');
-					const mbm = require(_path.resolve(__dirname, '..', '..', 'game-logic', 'MultiBattleManager'));
-					(global as any).__MULTI_BATTLE_MANAGER = new mbm.MultiBattleManager();
-				}
-				this.stream = new MultiTimeBattleStream((global as any).__MULTI_BATTLE_MANAGER, { keepAlive: true });
-			} else {
-				this.stream = PM.createStream();
+		if (fmt.timeline) {
+			if (!(global as any).__MULTI_BATTLE_MANAGER) {
+				(global as any).__MULTI_BATTLE_MANAGER = new MultiBattleManager();
+				console.log(`[TRANSFER DEBUG] Created MultiBattleManager, has transferPokemon: ${
+					typeof ((global as any).__MULTI_BATTLE_MANAGER).transferPokemon === 'function'
+				}`);
 			}
+			this.stream = new MultiTimeBattleStream(
+				(global as any).__MULTI_BATTLE_MANAGER,
+				{ keepAlive: true }
+			);
+		} else {
+			this.stream = PM.createStream();
+		}
 
 		let ratedMessage = options.ratedMessage || '';
 		if (this.rated) {
@@ -626,6 +625,25 @@ export class RoomBattle extends RoomGame<RoomBattlePlayer> {
 		this.start();
 	}
 
+	/**
+	 * Resolve this room's ID to the battle ID the manager actually knows about.
+	 * The stream is the single source of truth for this mapping.
+	 */
+	private resolveManagerBattleId(roomOrTimelineId?: string): string | null {
+		const id = roomOrTimelineId || this.roomid;
+
+		// If our stream is a MultiTimeBattleStream, use its resolver
+		if (this.stream && 'resolveManagerBattleId' in this.stream) {
+			return (this.stream as MultiTimeBattleStream).resolveManagerBattleId(id);
+		}
+
+		// Fallback: maybe the manager knows this ID directly
+		const manager = (global as any).__MULTI_BATTLE_MANAGER as MultiBattleManager | undefined;
+		if (manager?.getBattle(id)) return id;
+
+		return null;
+	}
+
 	checkActive() {
 		const active = (this.started && !this.ended && this.players.every(p => p.active));
 		Rooms.global.battleCount += (active ? 1 : 0) - (this.active ? 1 : 0);
@@ -639,10 +657,59 @@ export class RoomBattle extends RoomGame<RoomBattlePlayer> {
 			return;
 		}
 		const player = this.playerTable[user.id];
-		const [choice, rqid] = data.split('|', 2);
 		if (!player) return;
+
+		console.log(`[TRANSFER DEBUG] choose() raw data: "${data}"`);
+
+		// Check for transfer BEFORE splitting on '|'
+		if (data.startsWith('transfer|') || data.split('|')[0] === 'transfer') {
+			console.log(`[TRANSFER DEBUG] >>> TRANSFER DETECTED (pre-split) <<<`);
+			const parts = data.split('|');
+			// parts = ["transfer", timelineId, turn] or ["transfer", timelineId, turn, rqid]
+			const targetGlobalId = parts[1];
+			const targetTurn = parts[2];
+			const rqid = parts[3]; // optional
+
+			const request = player.request;
+			if (request.isWait !== false && request.isWait !== true) {
+				player.sendRoom(`|error|[Invalid choice] There's nothing to choose`);
+				return;
+			}
+			if (rqid && rqid !== `${request.rqid}`) {
+				player.sendRoom(`|error|[Invalid choice] Sorry, too late`);
+				return;
+			}
+
+			const targetTurnNum = parseInt(targetTurn);
+			if (!targetGlobalId || isNaN(targetTurnNum)) {
+				console.log(`[TRANSFER DEBUG] Invalid: id="${targetGlobalId}", turn="${targetTurn}"`);
+				player.sendRoom(`|error|[Invalid transfer] Invalid timeline or turn number`);
+				return;
+			}
+
+			request.isWait = true;
+			const result = this.queueTransfer(player, targetGlobalId, targetTurnNum);
+			console.log(`[TRANSFER DEBUG] queueTransfer result:`, JSON.stringify(result));
+			if (!result.success) {
+				request.isWait = false;
+				player.sendRoom(`|error|[Invalid transfer] ${result.error}`);
+				return;
+			}
+			request.choice = `transfer|${targetGlobalId}|${targetTurnNum}`;
+			player.sendRoom(`|message|Transfer queued to ${result.targetCoord}`);
+			return;
+		}
+
+		// Normal choice path (existing code)
+		const [choice, rqid] = data.split('|', 2);
+
+		if (!player) {
+			console.log(`[TRANSFER DEBUG] No player found for user ${user.id}`);
+			return;
+		}
 		const request = player.request;
 		if (request.isWait !== false && request.isWait !== true) {
+			console.log(`[TRANSFER DEBUG] Request blocked - isWait: ${request.isWait}`);
 			player.sendRoom(`|error|[Invalid choice] There's nothing to choose`);
 			return;
 		}
@@ -654,23 +721,6 @@ export class RoomBattle extends RoomGame<RoomBattlePlayer> {
 		}
 		request.isWait = true;
 		request.choice = choice;
-
-		// Handle transfer choice format: "transfer|timelineId|turn"
-		if (choice.startsWith('transfer')) {
-			const [, targetGlobalId, targetTurn] = choice.split('|');
-			const targetTurnNum = parseInt(targetTurn);
-			if (!targetGlobalId || isNaN(targetTurnNum)) {
-				player.sendRoom(`|error|[Invalid transfer] Invalid timeline or turn number`);
-				return;
-			}
-			const result = this.queueTransfer(player, targetGlobalId, targetTurnNum);
-			if (!result.success) {
-				player.sendRoom(`|error|[Invalid transfer] ${result.error}`);
-				return;
-			}
-			player.sendRoom(`|message|Transfer queued to ${result.targetCoord}`);
-			return;
-		}
 
 		void this.stream.write(`>${player.slot} ${choice}`);
 	}
@@ -1380,64 +1430,30 @@ export class RoomBattle extends RoomGame<RoomBattlePlayer> {
 	 */
 	generateTransferUI(nodes: any[]): string {
 		if (!nodes || nodes.length === 0) {
-			return '<div style="margin-top: 8px; padding: 12px; border: 1px solid #ddd; ' +
-				'border-radius: 4px; background: #f9f9f9; text-align: center; ' +
-				'color: #999; font-size: 12px;">No transfer targets available yet</div>';
+			return '<div style="margin-top:8px;padding:12px;border:1px solid #ddd;' +
+				'border-radius:4px;background:#f9f9f9;text-align:center;' +
+				'color:#999;font-size:12px;">No transfer targets available yet</div>';
 		}
 
-		// Create options for each unique timeline node
-		const options = nodes.map(node => {
+		const buttons = nodes.map(node => {
 			const p1Name = node.p1Active?.name || 'Empty';
 			const p2Name = node.p2Active?.name || 'Empty';
 			const label = `Timeline #${node.timelineNum}, Turn ${node.turn} (${p1Name} vs ${p2Name})`;
 			const value = `${node.timelineId}|${node.turn}`;
-			return `<option value="${value}">${label}</option>`;
+
+			// /msgroom routes the command to the specific battle room
+			return `<form data-submitsend="/msgroom ${this.roomid},/choose transfer|${value}">` +
+				`<button class="button" style="margin:4px;padding:8px 16px;` +
+				`background:#8844FF;color:white;border:none;border-radius:4px;` +
+				`font-weight:bold;font-size:12px;cursor:pointer;">` +
+				`${label}</button></form>`;
 		}).join('');
 
-		return '<div style="margin-top: 8px; padding: 12px; border: 2px solid #8844FF; ' +
-			'border-radius: 6px; background: #f8f0ff; font-family: Arial, sans-serif;">' +
-			'<div style="font-weight: bold; color: #333; margin-bottom: 8px; font-size: 13px;">' +
+		return '<div style="margin-top:8px;padding:12px;border:2px solid #8844FF;' +
+			'border-radius:6px;background:#f8f0ff;font-family:Arial,sans-serif;">' +
+			'<div style="font-weight:bold;color:#333;margin-bottom:8px;font-size:13px;">' +
 			'Transfer Active Pokémon to Timeline:</div>' +
-			'<div style="display: flex; gap: 8px;">' +
-			'<select id="ps-transfer-select" style="flex: 1; padding: 8px 10px; ' +
-			'border: 1px solid #ccc; border-radius: 4px; background: white; ' +
-			'font-size: 12px; cursor: pointer;">' +
-			'<option value="">-- Select a timeline node --</option>' +
-			options +
-			'</select>' +
-			'<button id="ps-transfer-btn" style="padding: 8px 16px; background: #8844FF; ' +
-			'color: white; border: none; border-radius: 4px; font-weight: bold; ' +
-			'font-size: 12px; cursor: pointer; min-width: 120px; transition: background 0.2s;">' +
-			'Transfer</button>' +
-			'</div>' +
-			'<script>' +
-			'(function() {' +
-			'  const btn = document.getElementById("ps-transfer-btn");' +
-			'  const sel = document.getElementById("ps-transfer-select");' +
-			'  if (!btn || !sel) return;' +
-			'  function _psSendChoose(cmd) {' +
-			'    try {' +
-			'      if (typeof PS !== "undefined" && PS.socket && PS.socket.send) { PS.socket.send(cmd); return true; }' +
-			'      if (window.socket && typeof window.socket.send === "function") { window.socket.send(cmd); return true; }' +
-			'      if (window.parent && (window.parent as any).PS && (window.parent as any).PS.socket && typeof (window.parent as any).PS.socket.send === "function") { (window.parent as any).PS.socket.send(cmd); return true; }' +
-			'      if (window.parent && window.parent.socket && typeof window.parent.socket.send === "function") { window.parent.socket.send(cmd); return true; }' +
-			'      const chatInput = document.querySelector("form input[type=\"text\"], #chatform input[type=\"text\"]") as HTMLInputElement | null;' +
-			'      if (chatInput && chatInput.form) { chatInput.value = cmd; chatInput.form.dispatchEvent(new Event("submit", { cancelable: true })); return true; }' +
-			'    } catch (e) {}' +
-			'    return false; }' +
-			'  btn.addEventListener("click", function() {' +
-			'    const val = sel.value;' +
-			'    if (!val) { alert("Please select a timeline node"); return; }' +
-			'    if (!_psSendChoose("/choose transfer|" + val)) { alert("Battle connection not ready"); }' +
-			'  });' +
-			'  btn.addEventListener("mouseover", function() {' +
-			'    this.style.background = "#7734dd";' +
-			'  });' +
-			'  btn.addEventListener("mouseout", function() {' +
-			'    this.style.background = "#8844FF";' +
-			'  });' +
-			'})();' +
-			'</script>' +
+			buttons +
 			'</div>';
 	}
 
@@ -1450,21 +1466,26 @@ export class RoomBattle extends RoomGame<RoomBattlePlayer> {
 		if (!manager) return [];
 
 		try {
-			// Get linked battles (other timelines) from this battle
-			const linkedBattles = manager.getLinkedBattles(this.roomid) || [];
-			if (linkedBattles.length === 0) return [];
+			// Resolve our room ID to the manager's battle ID
+			const resolvedId = this.resolveManagerBattleId(this.roomid);
+			if (!resolvedId) {
+				console.log(`[TRANSFER DEBUG] getTransferTargets: could not resolve roomid "${this.roomid}"`);
+				return [];
+			}
+
+			// Get linked battles using the resolved ID
+			const linkedBattleIds = manager.battleLinks.get(resolvedId) || [];
+			if (linkedBattleIds.length === 0) return [];
 
 			const targets: any[] = [];
 
-			// For each linked timeline, get the snapshot and create transfer targets
-			for (const linkedBattle of linkedBattles) {
-				const snapshot = manager.getSnapshot(linkedBattle.id);
+			for (const linkedBattleId of linkedBattleIds) {
+				const snapshot = manager.getSnapshot(linkedBattleId);
 				if (!snapshot) continue;
 
-				// Create a target node for each turn available in that timeline
 				targets.push({
-					timelineId: linkedBattle.id,
-					timelineNum: targets.filter(t => t.timelineId === linkedBattle.id).length + 1,
+					timelineId: linkedBattleId,
+					timelineNum: targets.length + 1,
 					turn: snapshot.turn,
 					p1Active: snapshot.p1.active[0] || null,
 					p2Active: snapshot.p2.active[0] || null,
@@ -1488,39 +1509,61 @@ export class RoomBattle extends RoomGame<RoomBattlePlayer> {
 		targetBattleId: string,
 		targetTurn: number
 	): { success: boolean; error?: string; targetCoord?: string } {
-		const manager = (global as any).__MULTI_BATTLE_MANAGER;
+		const manager = (global as any).__MULTI_BATTLE_MANAGER as MultiBattleManager | undefined;
 		if (!manager) {
 			return { success: false, error: 'Timeline manager not available' };
 		}
 
+		// Resolve IDs through the stream's mapping
+		const resolvedSourceId = this.resolveManagerBattleId(this.roomid);
+		const resolvedTargetId = this.resolveManagerBattleId(targetBattleId);
+
+		console.log(`[TRANSFER DEBUG] queueTransfer called`);
+		console.log(`[TRANSFER DEBUG]   this.roomid: "${this.roomid}"`);
+		console.log(`[TRANSFER DEBUG]   resolvedSourceId: "${resolvedSourceId}"`);
+		console.log(`[TRANSFER DEBUG]   targetBattleId (raw): "${targetBattleId}"`);
+		console.log(`[TRANSFER DEBUG]   resolvedTargetId: "${resolvedTargetId}"`);
+		console.log(`[TRANSFER DEBUG]   targetTurn: ${targetTurn}`);
+		console.log(`[TRANSFER DEBUG]   player: ${player.slot}`);
+		console.log(`[TRANSFER DEBUG]   manager.battles keys: [${manager.getBattleIds().join(', ')}]`);
+
+		if (!resolvedSourceId) {
+			return { success: false, error: `Source battle "${this.roomid}" not found in manager (no mapping exists)` };
+		}
+		if (!resolvedTargetId) {
+			return { success: false, error: `Target battle "${targetBattleId}" not found in manager (no mapping exists)` };
+		}
+
 		try {
-			// Transfer from current battle (active pokemon at position 0)
 			const result = manager.transferPokemon(
-				this.roomid,                    // sourceBattleId
-				player.slot as 'p1' | 'p2',     // sourceSide
-				0,                              // sourcePosition (active pokemon)
-				targetBattleId,                 // destBattleId
-				player.slot as 'p1' | 'p2',     // destSide (same player slot)
-				true                            // switchIn
+				resolvedSourceId,
+				player.slot as 'p1' | 'p2',
+				0,
+				resolvedTargetId,
+				player.slot as 'p1' | 'p2',
+				true
 			);
 
+			console.log(`[TRANSFER DEBUG] transferPokemon result:`, JSON.stringify(result));
+
 			if (result.success && result.transferredPokemon) {
-				// Mark that this player has made their choice
 				const request = player.request;
 				request.isWait = true;
 				request.choice = `transfer|${targetBattleId}|${targetTurn}`;
-				
+
 				const pokeName = result.transferredPokemon.set.name || result.transferredPokemon.species;
 				const coord = `Battle ${targetBattleId}, Turn ${targetTurn}`;
-				
-				// Log the transfer to stream
+
+				console.log(`[TRANSFER DEBUG] SUCCESS: ${pokeName} -> ${coord}`);
 				void this.stream.write(`|-message|${pokeName} transferred to ${coord}`);
-				
+
 				return { success: true, targetCoord: coord };
 			}
 
 			return { success: false, error: result.error || 'Transfer failed' };
 		} catch (e: any) {
+			console.log(`[TRANSFER DEBUG] EXCEPTION: ${e.message}`);
+			console.log(`[TRANSFER DEBUG] Stack: ${e.stack}`);
 			Monitor.crashlog(e, 'Error queuing transfer', { roomid: this.roomid });
 			return { success: false, error: 'Transfer failed: ' + e.message };
 		}

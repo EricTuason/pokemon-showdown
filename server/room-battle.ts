@@ -1435,13 +1435,27 @@ export class RoomBattle extends RoomGame<RoomBattlePlayer> {
 				'color:#999;font-size:12px;">No transfer targets available yet</div>';
 		}
 
-		const buttons = nodes.map(node => {
+		// Filter out nodes that are invalid transfer targets:
+		// 1. Current turn (can't transfer to where you already are)
+		// 2. Empty slots (turn 0 or no active Pokémon on either side)
+		const validNodes = nodes.filter(node =>
+			!node.isCurrent &&
+			node.turn > 0 &&
+			(node.p1Active !== null || node.p2Active !== null)
+		);
+
+		if (validNodes.length === 0) {
+			return '<div style="margin-top:8px;padding:12px;border:1px solid #ddd;' +
+				'border-radius:4px;background:#f9f9f9;text-align:center;' +
+				'color:#999;font-size:12px;">No transfer targets available yet</div>';
+		}
+
+		const buttons = validNodes.map(node => {
 			const p1Name = node.p1Active?.name || 'Empty';
 			const p2Name = node.p2Active?.name || 'Empty';
 			const label = `Timeline #${node.timelineNum}, Turn ${node.turn} (${p1Name} vs ${p2Name})`;
 			const value = `${node.timelineId}|${node.turn}`;
 
-			// /msgroom routes the command to the specific battle room
 			return `<form data-submitsend="/msgroom ${this.roomid},/choose transfer|${value}">` +
 				`<button class="button" style="margin:4px;padding:8px 16px;` +
 				`background:#8844FF;color:white;border:none;border-radius:4px;` +

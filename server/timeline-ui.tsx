@@ -9,11 +9,21 @@
 
 const SP = 'https://play.pokemonshowdown.com/sprites';
 
-const NODE_W = 170;
-const NODE_H = 110;
-const GAP_X = 28;
-const GAP_Y = 20;
-const PAD = 28;
+const NODE_W = 200;
+// Height scales with team size; base header + per-row height
+const HEADER_H = 28;
+const SIDE_LABEL_H = 14;
+const ROW_H = 22;        // height per pokemon row
+const SIDE_PAD = 4;      // padding inside a side block
+const MAX_TEAM = 6;
+// NODE_H is computed dynamically per node based on team sizes
+// For layout purposes we use a fixed estimate:
+const NODE_H_BASE = HEADER_H + (SIDE_LABEL_H + SIDE_PAD * 2 + ROW_H * MAX_TEAM) * 2 + 8;
+
+const GAP_X = 32;
+const GAP_Y = 24;
+const PAD  = 28;
+
 const LANE_COLORS = [
 	'#70a0ff', '#b090ff', '#70e080', '#f0d070',
 	'#ff7088', '#70d0e0', '#ffa070', '#f0a0c0',
@@ -27,7 +37,11 @@ export interface PokemonSnapshot {
 	species: string;
 	/** HP as percentage 0-100 */
 	hp: number;
+	/** Whether this pokemon is currently active on the field */
+	isActive?: boolean;
 	status?: string;
+	/** Whether this pokemon has fainted */
+	fainted?: boolean;
 }
 
 export interface TimelineNodeData {
@@ -38,8 +52,14 @@ export interface TimelineNodeData {
 	branchTurn: number | null;
 	isCurrent: boolean;
 	ended: boolean;
-	p1Active: PokemonSnapshot | null;
-	p2Active: PokemonSnapshot | null;
+	/** Full team snapshot for player 1 */
+	p1Team: PokemonSnapshot[];
+	/** Full team snapshot for player 2 */
+	p2Team: PokemonSnapshot[];
+	/** @deprecated use p1Team[].isActive instead */
+	p1Active?: PokemonSnapshot | null;
+	/** @deprecated use p2Team[].isActive instead */
+	p2Active?: PokemonSnapshot | null;
 }
 
 // ── Internal layout types ───────────────────────────────
@@ -52,6 +72,7 @@ interface LayoutNode {
 	row: number;
 	x: number;
 	y: number;
+	nodeH: number;
 	color: string;
 	isCurrent: boolean;
 	ended: boolean;
@@ -60,8 +81,8 @@ interface LayoutNode {
 	branchFromCol: number | null;
 	branchFromRow: number | null;
 	branchLabel: string | null;
-	p1Active: PokemonSnapshot | null;
-	p2Active: PokemonSnapshot | null;
+	p1Team: PokemonSnapshot[];
+	p2Team: PokemonSnapshot[];
 }
 
 interface Connection {
@@ -70,6 +91,15 @@ interface Connection {
 	x2: number; y2: number;
 	color: string;
 	dotColor?: string;
+}
+
+// ── Helpers ─────────────────────────────────────────────
+
+function computeNodeH(p1Team: PokemonSnapshot[], p2Team: PokemonSnapshot[]): number {
+	const p1Rows = Math.max(p1Team.length, 1);
+	const p2Rows = Math.max(p2Team.length, 1);
+	const sideH = (rows: number) => SIDE_LABEL_H + SIDE_PAD * 2 + rows * ROW_H;
+	return HEADER_H + sideH(p1Rows) + sideH(p2Rows) + 8;
 }
 
 // ── Layout computation ──────────────────────────────────
@@ -82,7 +112,6 @@ function computeLayout(data: TimelineNodeData[]): {
 } {
 	if (!data.length) return {nodes: [], connections: [], width: 0, height: 0};
 
-	// Unique timeline IDs sorted by their num
 	const timelineIds = [...new Set(data.map(n => n.timelineId))];
 	const numForId = new Map<string, number>();
 	for (const d of data) numForId.set(d.timelineId, d.timelineNum);
@@ -91,12 +120,10 @@ function computeLayout(data: TimelineNodeData[]): {
 	const colFor = new Map<string, number>();
 	timelineIds.forEach((id, i) => colFor.set(id, i));
 
-	// Unique sorted turns → compact row indices
 	const allTurns = [...new Set(data.map(n => n.turn))].sort((a, b) => a - b);
 	const rowFor = new Map<number, number>();
 	allTurns.forEach((t, i) => rowFor.set(t, i));
 
-	// Parent/branch info per timeline (from first node encountered)
 	const parentIdFor = new Map<string, string | null>();
 	const branchTurnFor = new Map<string, number | null>();
 	for (const d of data) {
@@ -106,13 +133,35 @@ function computeLayout(data: TimelineNodeData[]): {
 		}
 	}
 
-	// Group by timeline, sorted by turn
 	const grouped = new Map<string, TimelineNodeData[]>();
 	for (const d of data) {
 		if (!grouped.has(d.timelineId)) grouped.set(d.timelineId, []);
 		grouped.get(d.timelineId)!.push(d);
 	}
 	for (const arr of grouped.values()) arr.sort((a, b) => a.turn - b.turn);
+
+	// We need per-row max heights to compute y positions
+	// First pass: compute node heights per (col, row)
+	// For y positioning we use the max nodeH in each row
+	const rowMaxH = new Map<number, number>();
+	for (const [, tlNodes] of grouped) {
+		for (const d of tlNodes) {
+			const row = rowFor.get(d.turn) || 0;
+			const p1Team = d.p1Team?.length ? d.p1Team : (d.p1Active ? [d.p1Active] : []);
+			const p2Team = d.p2Team?.length ? d.p2Team : (d.p2Active ? [d.p2Active] : []);
+			const h = computeNodeH(p1Team, p2Team);
+			rowMaxH.set(row, Math.max(rowMaxH.get(row) || 0, h));
+		}
+	}
+
+	// Compute cumulative y offsets per row
+	const rowY = new Map<number, number>();
+	let yAccum = PAD;
+	const sortedRows = [...new Set(data.map(n => rowFor.get(n.turn) || 0))].sort((a, b) => a - b);
+	for (const row of sortedRows) {
+		rowY.set(row, yAccum);
+		yAccum += (rowMaxH.get(row) || NODE_H_BASE) + GAP_Y;
+	}
 
 	// Build layout nodes
 	const nodes: LayoutNode[] = [];
@@ -127,6 +176,10 @@ function computeLayout(data: TimelineNodeData[]): {
 			const isFirst = idx === 0;
 			const isBranch = isFirst && parentTlId !== null;
 
+			const p1Team = d.p1Team?.length ? d.p1Team : (d.p1Active ? [d.p1Active] : []);
+			const p2Team = d.p2Team?.length ? d.p2Team : (d.p2Active ? [d.p2Active] : []);
+			const nodeH = computeNodeH(p1Team, p2Team);
+
 			let branchFromCol: number | null = null;
 			let branchFromRow: number | null = null;
 			let branchLabel: string | null = null;
@@ -134,18 +187,19 @@ function computeLayout(data: TimelineNodeData[]): {
 				branchFromCol = colFor.get(parentTlId) ?? null;
 				branchFromRow = bTurn !== null ? (rowFor.get(bTurn) ?? null) : null;
 				const pNum = numForId.get(parentTlId) || '?';
-				branchLabel = `from ${pNum}:${bTurn ?? '?'}`;
+				branchLabel = `from #${pNum} t${bTurn ?? '?'}`;
 			}
 
 			nodes.push({
 				timelineId: tlId, timelineNum: d.timelineNum,
 				turn: d.turn, col, row,
 				x: PAD + col * (NODE_W + GAP_X),
-				y: PAD + row * (NODE_H + GAP_Y),
+				y: rowY.get(row) || PAD,
+				nodeH,
 				color, isCurrent: d.isCurrent, ended: d.ended,
 				isFirst, isBranch,
 				branchFromCol, branchFromRow, branchLabel,
-				p1Active: d.p1Active, p2Active: d.p2Active,
+				p1Team, p2Team,
 			});
 		});
 	}
@@ -153,7 +207,7 @@ function computeLayout(data: TimelineNodeData[]): {
 	// Build connections
 	const connections: Connection[] = [];
 
-	// Vertical progression lines within each timeline
+	// Vertical lines within each timeline
 	for (const [tlId] of grouped) {
 		const tlNodes = nodes
 			.filter(n => n.timelineId === tlId)
@@ -164,80 +218,118 @@ function computeLayout(data: TimelineNodeData[]): {
 			connections.push({
 				type: 'vertical',
 				x1: a.x + NODE_W / 2,
-				y1: a.y + NODE_H,       // bottom edge of card
+				y1: a.y + a.nodeH,
 				x2: b.x + NODE_W / 2,
-				y2: b.y,                 // top edge of next card
+				y2: b.y,
 				color: a.color,
 			});
 		}
 	}
 
-	// Branch lines from parent node to child's first node
+	// Branch lines
 	for (const n of nodes) {
 		if (!n.isBranch || n.branchFromCol === null || n.branchFromRow === null) continue;
-		const px = PAD + n.branchFromCol * (NODE_W + GAP_X) + NODE_W;  // right edge of parent
-		const py = PAD + n.branchFromRow * (NODE_H + GAP_Y) + NODE_H / 2;  // vertical center
+		const px = PAD + n.branchFromCol * (NODE_W + GAP_X) + NODE_W;
+		const parentRowH = rowMaxH.get(n.branchFromRow) || NODE_H_BASE;
+		const py = (rowY.get(n.branchFromRow) || PAD) + parentRowH / 2;
 		const parentColor = LANE_COLORS[n.branchFromCol % LANE_COLORS.length];
 		connections.push({
 			type: 'branch',
 			x1: px,
 			y1: py,
-			x2: n.x,                    // left edge of child
-			y2: n.y + NODE_H / 2,       // vertical center
+			x2: n.x,
+			y2: n.y + n.nodeH / 2,
 			color: n.color,
 			dotColor: parentColor,
 		});
 	}
 
 	const maxCol = Math.max(...nodes.map(n => n.col), 0);
-	const maxRow = Math.max(...nodes.map(n => n.row), 0);
+	const totalH = yAccum;
 
 	return {
 		nodes, connections,
 		width: PAD * 2 + (maxCol + 1) * (NODE_W + GAP_X) - GAP_X,
-		height: PAD * 2 + (maxRow + 1) * (NODE_H + GAP_Y) - GAP_Y,
+		height: totalH,
 	};
 }
 
 // ── Sprite URL ──────────────────────────────────────────
 
 function gen5Sprite(speciesId: string): string {
-	// speciesId should already be "deoxys-speed", "alomomola" etc
 	return `${SP}/gen5/${speciesId}.png`;
 }
 
 // ── HTML fragments ──────────────────────────────────────
 
-function pokeSideHTML(poke: PokemonSnapshot | null, label: string): string {
-	if (!poke) {
-		return '<div style="display:flex;flex-direction:column;align-items:center;width:72px;">' +
-			`<div style="width:40px;height:30px;display:flex;align-items:center;` +
-			`justify-content:center;font-size:18px;color:#ccc;">\u2014</div>` +
-			`<div style="font-size:9px;color:#bbb;margin-top:1px;">${label}</div>` +
-			'</div>';
-	}
+/**
+ * Renders a single pokemon row inside a side block.
+ * Layout: [sprite 20x15] [name/status] [HP bar]
+ */
+function pokeRowHTML(poke: PokemonSnapshot): string {
+	const fainted = poke.fainted || poke.hp <= 0;
+	const hpColor = fainted
+		? '#bbb'
+		: poke.hp > 50 ? '#4caf50'
+		: poke.hp > 20 ? '#f0d040'
+		: '#e04040';
 
-	const hpColor = poke.hp > 50 ? '#4caf50' : poke.hp > 20 ? '#f0d040' : '#e04040';
-	const statusHTML = poke.status
-		? '<span style="display:inline-block;font-size:7px;padding:0 2px;border-radius:2px;' +
+	const activeDot = poke.isActive
+		? '<div style="width:5px;height:5px;border-radius:50%;background:#4caf50;' +
+		  'flex-shrink:0;align-self:center;margin-right:2px;"></div>'
+		: '<div style="width:5px;flex-shrink:0;margin-right:2px;"></div>';
+
+	const statusBadge = poke.status && !fainted
+		? `<span style="display:inline-block;font-size:6px;padding:0 2px;border-radius:2px;` +
 		  `background:#888;color:white;margin-left:2px;text-transform:uppercase;` +
-		  `vertical-align:middle;line-height:10px;">${poke.status}</span>`
+		  `vertical-align:middle;line-height:9px;">${poke.status}</span>`
+		: fainted
+		? `<span style="display:inline-block;font-size:6px;padding:0 2px;border-radius:2px;` +
+		  `background:#e04040;color:white;margin-left:2px;vertical-align:middle;` +
+		  `line-height:9px;">FNT</span>`
 		: '';
 
-	return '<div style="display:flex;flex-direction:column;align-items:center;width:72px;">' +
+	const nameStyle = fainted ? 'color:#aaa;text-decoration:line-through;' : 'color:#333;';
+	const imgStyle = fainted ? 'opacity:0.35;' : '';
+
+	return '<div style="display:flex;align-items:center;height:' + ROW_H + 'px;' +
+		'padding:0 4px;box-sizing:border-box;">' +
+		activeDot +
 		// Sprite
-		`<img src="${gen5Sprite(poke.species)}" width="40" height="30" ` +
-		`style="image-rendering:pixelated;display:block;" />` +
-		// Name on its own line
-		'<div style="font-size:9px;font-weight:bold;color:#333;text-align:center;' +
-		`width:72px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;` +
-		`margin-top:1px;line-height:12px;">${poke.name}${statusHTML}</div>` +
+		`<img src="${gen5Sprite(poke.species)}" width="20" height="15" ` +
+		`style="image-rendering:pixelated;flex-shrink:0;${imgStyle}" />` +
+		// Name + status
+		'<div style="flex:1;min-width:0;margin-left:3px;">' +
+		`<div style="font-size:8px;font-weight:${poke.isActive ? 'bold' : 'normal'};` +
+		`${nameStyle}overflow:hidden;text-overflow:ellipsis;white-space:nowrap;` +
+		`line-height:11px;">${poke.name}${statusBadge}</div>` +
 		// HP bar
-		'<div style="width:60px;height:4px;background:#ddd;border-radius:2px;' +
-		'overflow:hidden;margin-top:2px;">' +
-		`<div style="width:${poke.hp}%;height:100%;background:${hpColor};` +
-		`border-radius:2px;"></div>` +
+		'<div style="width:100%;height:3px;background:#e0e0e0;border-radius:2px;' +
+		'overflow:hidden;margin-top:1px;">' +
+		`<div style="width:${fainted ? 0 : poke.hp}%;height:100%;background:${hpColor};` +
+		`border-radius:2px;transition:width 0.3s;"></div>` +
 		'</div>' +
+		'</div>' +
+		'</div>';
+}
+
+/**
+ * Renders a side block (P1 or P2) with label + all team members.
+ */
+function sideBlockHTML(team: PokemonSnapshot[], label: string, borderColor: string): string {
+	const rows = team.length
+		? team.map(p => pokeRowHTML(p)).join('')
+		: '<div style="height:' + ROW_H + 'px;display:flex;align-items:center;' +
+		  'justify-content:center;font-size:9px;color:#bbb;">\u2014</div>';
+
+	return '<div style="border:1px solid ' + borderColor + '30;border-radius:4px;' +
+		'margin:2px 4px;background:' + borderColor + '08;">' +
+		// Label bar
+		'<div style="font-size:8px;font-weight:bold;color:' + borderColor + ';' +
+		'padding:1px 5px;border-bottom:1px solid ' + borderColor + '30;' +
+		'background:' + borderColor + '14;border-radius:4px 4px 0 0;">' +
+		label + '</div>' +
+		rows +
 		'</div>';
 }
 
@@ -247,39 +339,36 @@ function nodeCardHTML(node: LayoutNode): string {
 	const bg = node.ended ? '#f5f5f5' : (node.isCurrent ? '#fff8f0' : 'white');
 	const shadow = node.isCurrent ? 'box-shadow:0 0 8px rgba(255,107,107,0.4);' : '';
 
-	// Branch tag (floats above card)
 	const branchTag = node.branchLabel
-		? `<div style="position:absolute;top:-9px;right:6px;font-size:8px;` +
+		? `<div style="position:absolute;top:-9px;right:6px;font-size:7px;` +
 		  `background:#e74c3c;color:white;padding:1px 5px;border-radius:3px;` +
-		  `white-space:nowrap;">${node.branchLabel}</div>`
+		  `white-space:nowrap;z-index:1;">${node.branchLabel}</div>`
 		: '';
 
 	const endedBadge = node.ended
 		? '<span style="font-size:8px;color:#999;font-weight:normal;"> ended</span>'
 		: '';
 
+	const p1HTML = sideBlockHTML(node.p1Team, 'P1', node.color);
+	const p2HTML = sideBlockHTML(node.p2Team, 'P2', '#e07070');
+
 	return `<div style="position:absolute;left:${node.x}px;top:${node.y}px;` +
-		`width:${NODE_W}px;height:${NODE_H}px;">` +
-		// Card
+		`width:${NODE_W}px;height:${node.nodeH}px;">` +
 		`<div style="width:100%;height:100%;border:${borderW}px solid ${borderColor};` +
-		`border-radius:8px;background:${bg};${shadow}overflow:hidden;position:relative;">` +
+		`border-radius:8px;background:${bg};${shadow}overflow:hidden;position:relative;` +
+		`box-sizing:border-box;">` +
 		branchTag +
 		// Header
 		`<div style="display:flex;justify-content:space-between;align-items:center;` +
-		`padding:3px 8px;background:${node.color}18;border-bottom:1px solid ${node.color}40;">` +
-		`<span style="font-size:10px;font-weight:bold;color:#444;">Turn ${node.turn}${endedBadge}</span>` +
-		`<span style="font-size:9px;font-weight:bold;color:${node.color};">` +
-		`#${node.timelineNum}</span>` +
+		`height:${HEADER_H}px;padding:0 8px;background:${node.color}18;` +
+		`border-bottom:1px solid ${node.color}40;flex-shrink:0;">` +
+		`<span style="font-size:10px;font-weight:bold;color:#444;">` +
+		`Turn ${node.turn}${endedBadge}</span>` +
+		`<span style="font-size:9px;font-weight:bold;color:${node.color};">#${node.timelineNum}</span>` +
 		'</div>' +
-		// Pokemon area: p1 vs p2 side by side
-		'<div style="display:flex;align-items:center;justify-content:center;' +
-		`padding:4px 2px 2px;gap:0px;height:${NODE_H - 28}px;">` +
-		pokeSideHTML(node.p1Active, 'P1') +
-		// VS divider
-		'<div style="font-size:8px;color:#bbb;font-weight:bold;' +
-		'margin:0 2px;align-self:center;">vs</div>' +
-		pokeSideHTML(node.p2Active, 'P2') +
-		'</div>' +
+		// Teams
+		p1HTML +
+		p2HTML +
 		'</div></div>';
 }
 
@@ -298,12 +387,10 @@ function branchLineHTML(c: Connection): string {
 	const angle = Math.atan2(dy, dx) * (180 / Math.PI);
 
 	return (
-		// Dashed line
 		`<div style="position:absolute;left:${c.x1}px;top:${c.y1}px;` +
 		`width:${Math.round(len)}px;height:0;border-top:2px dashed ${c.color};` +
 		`transform-origin:0 0;transform:rotate(${angle.toFixed(1)}deg);` +
 		`opacity:0.7;"></div>` +
-		// Dot at origin
 		`<div style="position:absolute;left:${c.x1 - 5}px;top:${c.y1 - 5}px;` +
 		`width:10px;height:10px;border-radius:50%;` +
 		`background:${c.dotColor || c.color};border:2px solid white;"></div>`
@@ -334,12 +421,10 @@ export function generateTimelineHTML(data: {nodes: TimelineNodeData[]}): string 
 		` \u00b7 ${maxTurn} turn${maxTurn !== 1 ? 's' : ''}` +
 		(currentNode ? ` \u00b7 Active: #${currentNode.timelineNum}` : '');
 
-	// Connections (render behind nodes)
 	const connHTML = layout.connections.map(c =>
 		c.type === 'vertical' ? verticalLineHTML(c) : branchLineHTML(c)
 	).join('');
 
-	// Nodes
 	const nodeHTML = layout.nodes.map(n => nodeCardHTML(n)).join('');
 
 	// Legend
@@ -358,6 +443,9 @@ export function generateTimelineHTML(data: {nodes: TimelineNodeData[]}): string 
 	const currentLeg = '<div style="display:inline-flex;align-items:center;gap:4px;">' +
 		'<div style="width:10px;height:10px;border-radius:50%;border:2px solid #ff6b6b;"></div>' +
 		'<span>Current</span></div>';
+	const activeLeg = '<div style="display:inline-flex;align-items:center;gap:4px;">' +
+		'<div style="width:6px;height:6px;border-radius:50%;background:#4caf50;"></div>' +
+		'<span>Active</span></div>';
 
 	return '<div style="margin:8px 0;padding:12px;border:2px solid #aaa;border-radius:6px;' +
 		'background:white;font-family:Arial,Helvetica,sans-serif;">' +
@@ -369,17 +457,17 @@ export function generateTimelineHTML(data: {nodes: TimelineNodeData[]}): string 
 		`border-radius:4px;font-weight:bold;">${countLabel}</span>` +
 		'</div>' +
 		// Scrollable graph
-		'<div style="overflow:auto;max-height:420px;max-width:100%;' +
+		'<div style="overflow:auto;max-height:520px;max-width:100%;' +
 		'-webkit-overflow-scrolling:touch;' +
 		'background:#fafafa;border:1px solid #e0e0e0;border-radius:4px;padding:4px;">' +
 		`<div style="position:relative;width:${layout.width}px;` +
 		`height:${layout.height}px;min-width:${layout.width}px;">` +
 		connHTML + nodeHTML +
 		'</div></div>' +
-		// Legend bar
+		// Legend
 		'<div style="display:flex;gap:16px;margin-top:10px;padding-top:8px;' +
 		'border-top:1px solid #ddd;flex-wrap:wrap;justify-content:center;' +
 		'font-size:11px;color:#666;">' +
-		legendItems + branchLeg + currentLeg +
+		legendItems + branchLeg + currentLeg + activeLeg +
 		'</div></div>';
 }

@@ -12,31 +12,67 @@ import { Streams, Utils } from '../lib';
 import type { PokemonSnapshot, TimelineNodeData } from '../server/timeline-ui';
 
 function pokemonToSpriteId(pokemon: any): string {
-	// pokemon.species.name preserves hyphens: "Deoxys-Speed", "Mr. Mime"
-	// pokemon.species.id strips them: "deoxysspeed", "mrmime"
-	// Gen5 sprite files USE hyphens for forms: deoxys-speed.png
 	const name: string =
 		pokemon.species?.name ||
 		pokemon.speciesData?.name ||
 		pokemon.name ||
 		'substitute';
 	return name
-		.split(',')[0]  // strip gender suffix "Alomomola, M" → "Alomomola"
+		.split(',')[0]
 		.trim()
 		.toLowerCase()
-		.replace(/[^a-z0-9-]/g, '');  // keep hyphens, strip spaces/periods/etc
+		.replace(/[^a-z0-9-]/g, '');
 }
 
 function extractPokemonSnapshot(pokemon: any): PokemonSnapshot | null {
-	if (!pokemon || pokemon.fainted) return null;
+	if (!pokemon) return null;
+	const fainted = pokemon.fainted || pokemon.hp <= 0;
 	const spriteId = pokemonToSpriteId(pokemon);
 	return {
 		name: pokemon.name || pokemon.species?.name || spriteId,
 		species: spriteId,
-		hp: pokemon.maxhp > 0 ? Math.round((pokemon.hp / pokemon.maxhp) * 100) : 0,
+		hp: fainted ? 0 : (pokemon.maxhp > 0 ? Math.round((pokemon.hp / pokemon.maxhp) * 100) : 0),
 		status: pokemon.status || undefined,
+		isActive: !!pokemon.isActive,
+		fainted,
 	};
 }
+
+/**
+ * Extract the full team snapshot from a side object.
+ * Returns all pokemon on the side, not just the active one.
+ */
+function extractTeamSnapshot(side: any): PokemonSnapshot[] {
+	if (!side) return [];
+
+	// side.pokemon is the full team array in the sim
+	const team: any[] = side.pokemon || [];
+	if (team.length === 0) return [];
+
+	// Determine which pokemon are active
+	const activeSet = new Set<any>();
+	if (side.active) {
+		for (const a of side.active) {
+			if (a) activeSet.add(a);
+		}
+	}
+
+	return team.map(pokemon => {
+		const fainted = pokemon.fainted || pokemon.hp <= 0;
+		const spriteId = pokemonToSpriteId(pokemon);
+		return {
+			name: pokemon.name || pokemon.species?.name || spriteId,
+			species: spriteId,
+			hp: fainted ? 0 : (pokemon.maxhp > 0
+				? Math.round((pokemon.hp / pokemon.maxhp) * 100)
+				: 0),
+			status: pokemon.status || undefined,
+			isActive: activeSet.has(pokemon),
+			fainted,
+		};
+	});
+}
+
 /** MultiBattleManager type - defined in game-logic/MultiBattleManager.js */
 type MultiBattleManager = any;
 
@@ -153,9 +189,10 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 		this.battle = null;
 	}
 
+	// Stores full team snapshots per timeline per turn
 	private turnSnapshots: Map<string, Map<number, {
-		p1Active: PokemonSnapshot | null;
-		p2Active: PokemonSnapshot | null;
+		p1Team: PokemonSnapshot[];
+		p2Team: PokemonSnapshot[];
 	}>> = new Map();
 
 	private captureSnapshot(timelineId: string, battle: any) {
@@ -167,10 +204,17 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 		}
 		const history = this.turnSnapshots.get(timelineId)!;
 
-		history.set(turn, {
-			p1Active: extractPokemonSnapshot(battle.sides?.[0]?.active?.[0] ?? null),
-			p2Active: extractPokemonSnapshot(battle.sides?.[1]?.active?.[0] ?? null),
-		});
+		const p1Side = battle.sides?.[0] ?? null;
+		const p2Side = battle.sides?.[1] ?? null;
+
+		const p1Team = extractTeamSnapshot(p1Side);
+		const p2Team = extractTeamSnapshot(p2Side);
+
+		// Only store if we actually have team data
+		// (sides may not be populated yet on turn 0 before players are set)
+		if (p1Team.length > 0 || p2Team.length > 0) {
+			history.set(turn, { p1Team, p2Team });
+		}
 	}
 
 	/**
@@ -459,11 +503,18 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 				const parentHistory = this.turnSnapshots.get(this.battle.currentTimelineId);
 				if (parentHistory) {
 					const newHistory = new Map<number, {
-						p1Active: PokemonSnapshot | null;
-						p2Active: PokemonSnapshot | null;
+						p1Team: PokemonSnapshot[];
+						p2Team: PokemonSnapshot[];
 					}>();
 					for (const [t, snap] of parentHistory) {
-						if (t <= turn) newHistory.set(t, { ...snap });
+						if (t <= turn) {
+							// Deep copy each team array so mutation doesn't
+							// bleed between timelines
+							newHistory.set(t, {
+								p1Team: snap.p1Team.map(p => ({ ...p })),
+								p2Team: snap.p2Team.map(p => ({ ...p })),
+							});
+						}
 					}
 					this.turnSnapshots.set(newTimeline.globalId, newHistory);
 				}
@@ -499,9 +550,13 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 			const battle = this.manager.getBattle(entry.battleId);
 			const currentTurn = battle?.turn ?? 0;
 
+			// Always re-capture the latest state so the current turn is fresh
 			if (battle) this.captureSnapshot(globalId, battle);
 
 			const history = this.turnSnapshots.get(globalId);
+
+			// No history yet: emit a placeholder turn-0 node so the
+			// timeline appears in the tree immediately
 			if (!history || history.size === 0) {
 				allNodes.push({
 					timelineId: globalId,
@@ -512,8 +567,8 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 					branchTurn: entry.fromTurn,
 					isCurrent: this.battle?.currentTimelineId === globalId,
 					ended: battle?.ended ?? false,
-					p1Active: null,
-					p2Active: null,
+					p1Team: [],
+					p2Team: [],
 				});
 				continue;
 			}
@@ -531,8 +586,8 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 					isCurrent: this.battle?.currentTimelineId === globalId
 						&& turn === currentTurn,
 					ended: battle?.ended ?? false,
-					p1Active: snap.p1Active,
-					p2Active: snap.p2Active,
+					p1Team: snap.p1Team,
+					p2Team: snap.p2Team,
 				});
 			}
 		}

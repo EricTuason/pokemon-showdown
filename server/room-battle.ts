@@ -28,73 +28,6 @@ type ChannelIndex = 0 | 1 | 2 | 3 | 4;
 export type PlayerIndex = 1 | 2 | 3 | 4;
 export type ChallengeType = 'rated' | 'unrated' | 'challenge' | 'tour';
 
-// ============================================================
-// TEST INTERCEPT — remove this entire block when done
-import { Teams as TestTeams } from '../sim/teams';
-
-const TEST_REPLACE_TEAM_ON_TRANSFER = true;
-
-const TEST_TEAM_PACKED = TestTeams.pack([
-    {
-        name: 'Pikachu-Weak',
-        species: 'Pikachu',
-        item: '',
-        ability: 'Static',
-        moves: ['Volt Tackle'],
-        nature: 'Hardy',
-        gender: '',
-        evs: { hp: 0, atk: 0, def: 0, spa: 0, spd: 0, spe: 0 },
-        ivs: { hp: 31, atk: 31, def: 31, spa: 31, spd: 31, spe: 31 },
-        level: 100,
-    },
-    {
-        name: 'Pikachu-Strong',
-        species: 'Pikachu',
-        item: 'Light Ball',
-        ability: 'Static',
-        moves: ['Volt Tackle'],
-        nature: 'Jolly',
-        gender: '',
-        evs: { hp: 0, atk: 252, def: 0, spa: 0, spd: 0, spe: 252 },
-        ivs: { hp: 31, atk: 31, def: 31, spa: 31, spd: 31, spe: 31 },
-        level: 100,
-    },
-    {
-        name: 'Raichu',
-        species: 'Raichu',
-        item: '',
-        ability: 'Static',
-        moves: ['Surf', 'Thunderbolt'],
-        nature: 'Modest',
-        gender: '',
-        evs: { hp: 0, atk: 0, def: 0, spa: 252, spd: 0, spe: 252 },
-        ivs: { hp: 31, atk: 31, def: 31, spa: 31, spd: 31, spe: 31 },
-        level: 100,
-    },
-]);
-
-// Post-creation stat overrides for each slot index
-const TEST_TEAM_OVERRIDES: {
-    hp: number | null;    // null = leave at max
-    ppOverrides: { moveId: string; pp: number }[];
-}[] = [
-    {
-        // Pikachu-Weak: 1 HP, Volt Tackle 5/16 PP
-        hp: 1,
-        ppOverrides: [{ moveId: 'volttackle', pp: 5 }],
-    },
-    {
-        // Pikachu-Strong: full HP, Volt Tackle 12/16 PP
-        hp: null,
-        ppOverrides: [{ moveId: 'volttackle', pp: 12 }],
-    },
-    {
-        // Raichu: full HP, full PP on both moves
-        hp: null,
-        ppOverrides: [],
-    },
-];
-// ============================================================
 
 interface BattleRequestTracker {
 	rqid: number;
@@ -1596,7 +1529,6 @@ export class RoomBattle extends RoomGame<RoomBattlePlayer> {
 			return { success: false, error: 'Timeline manager not available' };
 		}
 
-		// Resolve IDs through the stream's mapping
 		const resolvedSourceId = this.resolveManagerBattleId(this.roomid);
 		const resolvedTargetId = this.resolveManagerBattleId(targetBattleId);
 
@@ -1610,209 +1542,61 @@ export class RoomBattle extends RoomGame<RoomBattlePlayer> {
 		console.log(`[TRANSFER DEBUG]   manager.battles keys: [${manager.getBattleIds().join(', ')}]`);
 
 		if (!resolvedSourceId) {
-			return { success: false, error: `Source battle "${this.roomid}" not found in manager (no mapping exists)` };
+			return { success: false, error: `Source battle "${this.roomid}" not found in manager` };
 		}
 		if (!resolvedTargetId) {
-			return { success: false, error: `Target battle "${targetBattleId}" not found in manager (no mapping exists)` };
+			return { success: false, error: `Target battle "${targetBattleId}" not found in manager` };
 		}
 
-		// ============================================================
-		// TEST INTERCEPT — remove this entire block when done
-		if (TEST_REPLACE_TEAM_ON_TRANSFER) {
-			console.log(`[TEST INTERCEPT] Transfer requested by ${player.slot} — replacing their team in battle "${resolvedSourceId}"`);
-
-			const battle = manager.getBattle(resolvedSourceId);
-			if (!battle) {
-				return { success: false, error: `[TEST] Could not find battle "${resolvedSourceId}"` };
-			}
-
-			const side = battle[player.slot as 'p1' | 'p2'];
-			if (!side) {
-				return { success: false, error: `[TEST] Could not find side ${player.slot}` };
-			}
-
-			// Parse the test team
-			const testSets = TestTeams.unpack(TEST_TEAM_PACKED);
-			if (!testSets) {
-				return { success: false, error: `[TEST] Failed to unpack test team` };
-			}
-
-			// Log BEFORE state
-			console.log(`[TEST INTERCEPT] Team BEFORE replacement:`);
-			for (const pokemon of side.pokemon) {
-				console.log(`[TEST INTERCEPT]   ${pokemon.name} | HP: ${pokemon.hp}/${pokemon.maxhp} | Active: ${pokemon.isActive} | Moves: ${pokemon.moveSlots.map((m: any) => `${m.id}(${m.pp}/${m.maxpp})`).join(', ')}`);
-			}
-
-			// ---- STEP 1: Store the currently active Pokemon's slot name for protocol ----
-			const oldActive = side.active[0];
-			const oldActiveName = oldActive?.name || 'unknown';
-
-			// ---- STEP 2: Properly faint all existing Pokemon ----
-			for (const pokemon of side.pokemon) {
-				pokemon.fainted = true;
-				pokemon.faintQueued = false;
-				pokemon.hp = 0;
-				pokemon.isActive = false;
-				pokemon.status = 'fnt' as any;
-			}
-			side.active[0] = null as any;
-
-			// ---- STEP 3: Clear old team completely ----
-			// Both the pokemon array AND the team array (PokemonSet[])
-			side.pokemon = [];
-			side.team = [];
-			side.pokemonLeft = 0; // reset to 0; addPokemon will increment
-
-			// ---- STEP 4: Add new Pokemon via addPokemon ----
-			// addPokemon already increments pokemonLeft, so do NOT increment again
-			for (const set of testSets) {
-				try {
-					const pokemon = side.addPokemon(set);
-					if (pokemon) {
-						console.log(`[TEST INTERCEPT] Added ${pokemon.name} — HP: ${pokemon.hp}/${pokemon.maxhp}`);
-					} else {
-						console.log(`[TEST INTERCEPT] addPokemon returned null for ${set.name}`);
-					}
-				} catch (e: any) {
-					console.log(`[TEST INTERCEPT] addPokemon threw for ${set.name}: ${e.message}`);
-				}
-			}
-
-			// ---- STEP 5: Also rebuild side.team to match ----
-			side.team = testSets;
-
-			// ---- STEP 6: Apply HP/PP overrides ----
-			for (let i = 0; i < side.pokemon.length && i < TEST_TEAM_OVERRIDES.length; i++) {
-				const pokemon = side.pokemon[i];
-				const overrides = TEST_TEAM_OVERRIDES[i];
-
-				if (overrides.hp !== null) {
-					pokemon.hp = overrides.hp;
-					console.log(`[TEST INTERCEPT] Set ${pokemon.name} HP to ${pokemon.hp}/${pokemon.maxhp}`);
-				}
-
-				for (const ppOverride of overrides.ppOverrides) {
-					for (const moveSlot of pokemon.moveSlots) {
-						if (moveSlot.id === ppOverride.moveId) {
-							moveSlot.pp = ppOverride.pp;
-							console.log(`[TEST INTERCEPT] Set ${pokemon.name} ${moveSlot.id} PP to ${moveSlot.pp}/${moveSlot.maxpp}`);
-						}
-					}
-				}
-			}
-
-			// ---- STEP 7: Emit protocol messages so the client updates ----
-			// Tell the client the old Pokemon left
-			battle.add('swap', `${side.id}a: ${oldActiveName}`, '');
-			
-			// Switch in the first new Pokemon properly through the engine
-			if (side.pokemon.length > 0) {
-				try {
-					battle.actions.switchIn(side.pokemon[0], 0);
-					console.log(`[TEST INTERCEPT] Switched in ${side.pokemon[0].name}`);
-				} catch (e: any) {
-					console.log(`[TEST INTERCEPT] switchIn threw: ${e.message}`);
-					// Manual fallback
-					side.active[0] = side.pokemon[0];
-					side.pokemon[0].isActive = true;
-					side.pokemon[0].activeTurns = 0;
-					side.pokemon[0].activeMoveActions = 0;
-					// Manually emit the switch protocol message
-					battle.add(
-						'switch',
-						`${side.id}a: ${side.pokemon[0].name}`,
-						side.pokemon[0].getDetails(),
-						`${side.pokemon[0].hp}/${side.pokemon[0].maxhp}`
-					);
-					console.log(`[TEST INTERCEPT] Manual switch-in with protocol message`);
-				}
-			}
-
-			// ---- STEP 8: Force the battle to send a new request to this side ----
-			// This is what makes the client show the new moves/team
-			try {
-				// Clear any existing choice state
-				side.choice = {
-					cantUndo: false,
-					error: '',
-					actions: [],
-					forcedSwitchesLeft: 0,
-					forcedPassesLeft: 0,
-					switchIns: new Set(),
-					zMove: false,
-					mega: false,
-					ultra: false,
-					dynamax: false,
-					terastallize: false,
-				};
-
-				// Tell the battle to re-send the request
-				// The battle.makeRequest method sends |request| to the client
-				// which includes the full team and available moves
-				if (typeof battle.makeRequest === 'function') {
-					battle.makeRequest('move');
-					console.log(`[TEST INTERCEPT] Sent new move request via battle.makeRequest`);
-				} else {
-					console.log(`[TEST INTERCEPT] WARNING: battle.makeRequest not found — client may not update`);
-				}
-			} catch (e: any) {
-				console.log(`[TEST INTERCEPT] makeRequest threw: ${e.message}`);
-			}
-
-			// ---- STEP 9: Flush battle updates to the stream ----
-			try {
-				battle.sendUpdates();
-				console.log(`[TEST INTERCEPT] Flushed battle updates`);
-			} catch (e: any) {
-				console.log(`[TEST INTERCEPT] sendUpdates threw: ${e.message}`);
-			}
-
-			// Log AFTER state
-			console.log(`[TEST INTERCEPT] Team AFTER replacement:`);
-			for (const pokemon of side.pokemon) {
-				console.log(`[TEST INTERCEPT]   ${pokemon.name} | HP: ${pokemon.hp}/${pokemon.maxhp} | Active: ${pokemon.isActive} | Fainted: ${pokemon.fainted} | Moves: ${pokemon.moveSlots.map((m: any) => `${m.id}(${m.pp}/${m.maxpp})`).join(', ')}`);
-			}
-			console.log(`[TEST INTERCEPT] pokemonLeft: ${side.pokemonLeft}, active: ${side.active.map((p: any) => p?.name || 'empty').join(', ')}`);
-			console.log(`[TEST INTERCEPT] side.team length: ${side.team.length}`);
-
-			const coord = `Battle ${targetBattleId}, Turn ${targetTurn}`;
-			return { success: true, targetCoord: `[TEST] Team replaced in ${coord}` };
+		// ── Step 1: Capture the active Pokemon's state from the source battle ──
+		const transferState = manager.getPokemonTransferState(
+			resolvedSourceId,
+			player.slot as 'p1' | 'p2',
+			0
+		);
+		if (!transferState) {
+			return { success: false, error: `No active Pokemon to transfer` };
 		}
-		// ============================================================
+		console.log(`[TRANSFER DEBUG] Captured transfer state for ${transferState.set.name || transferState.set.species}`);
 
-		try {
-			const result = manager.transferPokemon(
-				resolvedSourceId,
-				player.slot as 'p1' | 'p2',
-				0,
-				resolvedTargetId,
-				player.slot as 'p1' | 'p2',
-				true
-			);
+		// ── Step 2: Get the stored team from the target timeline node ──
+		const stream = this.stream as MultiTimeBattleStream;
+		if (!('getStoredSets' in stream)) {
+			return { success: false, error: `Stream does not support getStoredSets` };
+		}
 
-			console.log(`[TRANSFER DEBUG] transferPokemon result:`, JSON.stringify(result));
+		const targetSide = player.slot as 'p1' | 'p2';
+		const snapshotSets = stream.getStoredSets(resolvedTargetId, targetTurn, targetSide);
+		const snapshotDisplays = stream.getStoredSnapshots(resolvedTargetId, targetTurn, targetSide);
 
-			if (result.success && result.transferredPokemon) {
-				const request = player.request;
-				request.isWait = true;
-				request.choice = `transfer|${targetBattleId}|${targetTurn}`;
+		if (!snapshotSets || snapshotSets.length === 0) {
+			console.log(`[TRANSFER DEBUG] No stored sets found for target - using empty team`);
+		} else {
+			console.log(`[TRANSFER DEBUG] Found ${snapshotSets.length} stored sets for target timeline`);
+		}
 
-				const pokeName = result.transferredPokemon.set.name || result.transferredPokemon.species;
-				const coord = `Battle ${targetBattleId}, Turn ${targetTurn}`;
+		// ── Step 3: Replace the team in the source battle with the target ──
+		// snapshot team, and add the transferred Pokemon as active
+		const result = manager.replaceTeamFromSnapshot(
+			resolvedSourceId,
+			player.slot as 'p1' | 'p2',
+			snapshotSets || [],
+			snapshotDisplays || [],
+			transferState
+		);
 
-				console.log(`[TRANSFER DEBUG] SUCCESS: ${pokeName} -> ${coord}`);
-				void this.stream.write(`|-message|${pokeName} transferred to ${coord}`);
+		console.log(`[TRANSFER DEBUG] replaceTeamFromSnapshot result:`, JSON.stringify({
+			success: result.success,
+			error: result.error,
+			transferred: result.transferredPokemon?.set?.name,
+		}));
 
-				return { success: true, targetCoord: coord };
-			}
-
+		if (!result.success) {
 			return { success: false, error: result.error || 'Transfer failed' };
-		} catch (e: any) {
-			console.log(`[TRANSFER DEBUG] EXCEPTION: ${e.message}`);
-			console.log(`[TRANSFER DEBUG] Stack: ${e.stack}`);
-			Monitor.crashlog(e, 'Error queuing transfer', { roomid: this.roomid });
-			return { success: false, error: 'Transfer failed: ' + e.message };
 		}
+
+		const coord = `Timeline ${targetBattleId}, Turn ${targetTurn}`;
+		return { success: true, targetCoord: coord };
 	}
 }
 

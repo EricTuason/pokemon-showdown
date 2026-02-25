@@ -73,7 +73,6 @@ function extractTeamSnapshot(side: any): PokemonSnapshot[] {
 	});
 }
 
-/** MultiBattleManager type - defined in game-logic/MultiBattleManager.js */
 type MultiBattleManager = any;
 
 /**
@@ -94,6 +93,43 @@ function splitFirst(str: string, delimiter: string, limit = 1) {
 	}
 	splitStr.push(str);
 	return splitStr;
+}
+
+/**
+ * Extract full PokemonSet data from a side object.
+ * This is what we need to properly reconstruct Pokemon for transfer.
+ * Each Pokemon's .set property holds the original team set.
+ */
+function extractTeamSets(side: any): PokemonSet[] {
+	if (!side) return [];
+	const team: any[] = side.pokemon || [];
+	if (team.length === 0) return [];
+
+	return team.map(pokemon => {
+		// pokemon.set is the original PokemonSet used to create this Pokemon
+		const set = pokemon.set;
+		if (!set) return null;
+
+		return {
+			name: set.name || pokemon.name || '',
+			species: set.species || pokemon.species?.name || '',
+			item: set.item || pokemon.item || '',
+			ability: set.ability || pokemon.ability || '',
+			moves: set.moves || pokemon.moveSlots?.map((m: any) => m.id) || [],
+			nature: set.nature || '',
+			gender: set.gender || pokemon.gender || '',
+			evs: set.evs || { hp: 0, atk: 0, def: 0, spa: 0, spd: 0, spe: 0 },
+			ivs: set.ivs || { hp: 31, atk: 31, def: 31, spa: 31, spd: 31, spe: 31 },
+			level: set.level || pokemon.level || 100,
+			shiny: set.shiny,
+			happiness: set.happiness,
+			pokeball: set.pokeball,
+			hpType: set.hpType,
+			dynamaxLevel: set.dynamaxLevel,
+			gigantamax: set.gigantamax,
+			teraType: set.teraType,
+		} as PokemonSet;
+	}).filter((s): s is PokemonSet => s !== null);
 }
 
 /**
@@ -193,6 +229,8 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 	private turnSnapshots: Map<string, Map<number, {
 		p1Team: PokemonSnapshot[];
 		p2Team: PokemonSnapshot[];
+		p1Sets: PokemonSet[];   // ← NEW: full set data for reconstruction
+		p2Sets: PokemonSet[];   // ← NEW: full set data for reconstruction
 	}>> = new Map();
 
 	private captureSnapshot(timelineId: string, battle: any) {
@@ -210,10 +248,13 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 		const p1Team = extractTeamSnapshot(p1Side);
 		const p2Team = extractTeamSnapshot(p2Side);
 
-		// Only store if we actually have team data
-		// (sides may not be populated yet on turn 0 before players are set)
+		// ── NEW: extract full PokemonSet arrays for transfer reconstruction ──
+		const p1Sets = extractTeamSets(p1Side);
+		const p2Sets = extractTeamSets(p2Side);
+		// ── END NEW ──
+
 		if (p1Team.length > 0 || p2Team.length > 0) {
-			history.set(turn, { p1Team, p2Team });
+			history.set(turn, { p1Team, p2Team, p1Sets, p2Sets });
 		}
 	}
 
@@ -603,5 +644,59 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 			if (entry.num === num) return globalId;
 		}
 		return null;
+	}
+
+	/**
+	 * Get the stored PokemonSets for a specific timeline at a specific turn.
+	 * Used by room-battle.ts when executing a transfer.
+	 */
+	getStoredSets(
+		timelineId: string,
+		turn: number,
+		side: 'p1' | 'p2'
+	): PokemonSet[] | null {
+		const history = this.turnSnapshots.get(timelineId);
+		if (!history) {
+			console.log(`[Timeline Team] getStoredSets: no history for timeline "${timelineId}"`);
+			return null;
+		}
+
+		// Find the closest turn at or before the requested turn
+		let closestTurn = -1;
+		for (const [t] of history) {
+			if (t <= turn && t > closestTurn) closestTurn = t;
+		}
+
+		if (closestTurn === -1) {
+			console.log(`[Timeline Team] getStoredSets: no snapshot at or before turn ${turn}`);
+			return null;
+		}
+
+		const snap = history.get(closestTurn)!;
+		const sets = side === 'p1' ? snap.p1Sets : snap.p2Sets;
+		console.log(`[Timeline Team] getStoredSets("${timelineId}", turn=${turn}, side=${side}) -> ${sets.length} sets from turn ${closestTurn}`);
+		return sets;
+	}
+
+	/**
+	 * Get the stored PokemonSnapshot for a specific timeline at a specific turn.
+	 * Used alongside getStoredSets to get HP/status at that point in time.
+	 */
+	getStoredSnapshots(
+		timelineId: string,
+		turn: number,
+		side: 'p1' | 'p2'
+	): PokemonSnapshot[] | null {
+		const history = this.turnSnapshots.get(timelineId);
+		if (!history) return null;
+
+		let closestTurn = -1;
+		for (const [t] of history) {
+			if (t <= turn && t > closestTurn) closestTurn = t;
+		}
+		if (closestTurn === -1) return null;
+
+		const snap = history.get(closestTurn)!;
+		return side === 'p1' ? snap.p1Team : snap.p2Team;
 	}
 }

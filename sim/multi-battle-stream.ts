@@ -45,11 +45,9 @@ function extractPokemonSnapshot(pokemon: any): PokemonSnapshot | null {
 function extractTeamSnapshot(side: any): PokemonSnapshot[] {
 	if (!side) return [];
 
-	// side.pokemon is the full team array in the sim
 	const team: any[] = side.pokemon || [];
 	if (team.length === 0) return [];
 
-	// Determine which pokemon are active
 	const activeSet = new Set<any>();
 	if (side.active) {
 		for (const a of side.active) {
@@ -73,6 +71,7 @@ function extractTeamSnapshot(side: any): PokemonSnapshot[] {
 	});
 }
 
+/** MultiBattleManager type - defined in multi-battle-manager.ts */
 type MultiBattleManager = any;
 
 /**
@@ -97,8 +96,6 @@ function splitFirst(str: string, delimiter: string, limit = 1) {
 
 /**
  * Extract full PokemonSet data from a side object.
- * This is what we need to properly reconstruct Pokemon for transfer.
- * Each Pokemon's .set property holds the original team set.
  */
 function extractTeamSets(side: any): PokemonSet[] {
 	if (!side) return [];
@@ -106,7 +103,6 @@ function extractTeamSets(side: any): PokemonSet[] {
 	if (team.length === 0) return [];
 
 	return team.map(pokemon => {
-		// pokemon.set is the original PokemonSet used to create this Pokemon
 		const set = pokemon.set;
 		if (!set) return null;
 
@@ -180,6 +176,17 @@ class MultiTimeBattle {
 	}
 }
 
+/**
+ * Represents a transfer that has been requested but not yet executed.
+ * Stored until the turn resolves, then executed via the hooked send callback.
+ */
+interface PendingTransfer {
+	sideId: 'p1' | 'p2' | 'p3' | 'p4';
+	sourceBattleId: string;
+	targetGlobalId: string;
+	targetTurn: number;
+}
+
 export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string> {
 	debug: boolean;
 	noCatch: boolean;
@@ -205,6 +212,37 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 		globalId: string;
 	}> = new Map();
 	private timelineCounter = 0;
+	private turnJustResolved = false;
+
+	/**
+	 * Pending transfers: keyed by sideId. Only one transfer per side per turn.
+	 * These are NOT executed immediately — they wait until the turn resolves.
+	 */
+	private pendingTransfers: Map<string, {
+		sideId: 'p1' | 'p2' | 'p3' | 'p4';
+		sourceBattleId: string;
+		targetGlobalId: string;
+		targetTurn: number;
+	}> = new Map();
+
+	/**
+	 * When true, we are currently inside a sendUpdates flush triggered by
+	 * commitChoices (turn resolution). This is how we know the turn just ended.
+	 */
+	private turnResolving = false;
+
+	/**
+	 * The turn number before the current write operation started.
+	 * Used to detect when a turn has advanced.
+	 */
+	private turnBeforeWrite: number | undefined;
+
+	/**
+	 * Buffer for messages during transfer execution.
+	 * When we're processing transfers after turn resolution, we need to
+	 * hold the update messages and append transfer messages before flushing.
+	 */
+	private heldUpdateMessages: string[] | null = null;
 
 	constructor(
 		manager: MultiBattleManager,
@@ -229,8 +267,8 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 	private turnSnapshots: Map<string, Map<number, {
 		p1Team: PokemonSnapshot[];
 		p2Team: PokemonSnapshot[];
-		p1Sets: PokemonSet[];   // ← NEW: full set data for reconstruction
-		p2Sets: PokemonSet[];   // ← NEW: full set data for reconstruction
+		p1Sets: PokemonSet[];
+		p2Sets: PokemonSet[];
 	}>> = new Map();
 
 	private captureSnapshot(timelineId: string, battle: any) {
@@ -248,10 +286,8 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 		const p1Team = extractTeamSnapshot(p1Side);
 		const p2Team = extractTeamSnapshot(p2Side);
 
-		// ── NEW: extract full PokemonSet arrays for transfer reconstruction ──
 		const p1Sets = extractTeamSets(p1Side);
 		const p2Sets = extractTeamSets(p2Side);
-		// ── END NEW ──
 
 		if (p1Team.length > 0 || p2Team.length > 0) {
 			history.set(turn, { p1Team, p2Team, p1Sets, p2Sets });
@@ -260,7 +296,6 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 
 	/**
 	 * The room ID IS the match ID. No suffix, no transformation.
-	 * This is the canonical ID used everywhere.
 	 */
 	private getRootBattleId(): string {
 		return this.matchId!;
@@ -268,7 +303,6 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 
 	/**
 	 * Generate a branch battle ID that is deterministic and traceable.
-	 * Format: "{matchId}>>branch{N}" so it's clear it belongs to this match.
 	 */
 	private getBranchBattleId(): string {
 		return `${this.matchId}>>branch${this.timelineCounter + 1}`;
@@ -276,7 +310,6 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 
 	/**
 	 * Generate a unique timeline ID within this match.
-	 * For the root, this equals the matchId. For branches, includes the branch suffix.
 	 */
 	private generateTimelineId(battleId: string): string {
 		return battleId;
@@ -284,18 +317,14 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 
 	/**
 	 * Resolve any ID (room-facing or internal) to the manager's registered battle ID.
-	 * Checks the mapping first, then falls back to direct lookup.
 	 */
 	resolveManagerBattleId(roomOrTimelineId: string): string | null {
-		// Direct hit in our mapping
 		if (this.managedBattleIds.has(roomOrTimelineId)) {
 			return this.managedBattleIds.get(roomOrTimelineId)!;
 		}
-		// Maybe it's already a manager ID
 		if (this.manager.getBattle(roomOrTimelineId)) {
 			return roomOrTimelineId;
 		}
-		// Check timeline registry
 		for (const [globalId, entry] of this.timelineRegistry) {
 			if (entry.battleId === roomOrTimelineId) return entry.battleId;
 			if (globalId === roomOrTimelineId) return entry.battleId;
@@ -321,8 +350,6 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 			globalId,
 		});
 
-		// Register the bidirectional mapping:
-		// roomId -> managerBattleId AND managerBattleId -> managerBattleId
 		this.managedBattleIds.set(globalId, battleId);
 		this.managedBattleIds.set(battleId, battleId);
 
@@ -340,7 +367,13 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 		return this.manager.getBattle(entry.battleId) || null;
 	}
 
-	/** Hook a battle's send to capture snapshots and emit tree updates */
+	/**
+	 * Hook a battle's send callback.
+	 * 
+	 * We CANNOT execute transfers inside this callback because that would
+	 * cause recursive sendUpdates() calls. Instead, we set a flag that
+	 * _write() checks after sendUpdates() returns.
+	 */
 	private hookBattleSend(globalId: string, battle: any) {
 		if (!battle) return;
 
@@ -350,9 +383,254 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 
 			if (sendType === 'update') {
 				this.captureSnapshot(globalId, battle);
-				this.emitTimelineUpdate();
+
+				// If we have pending transfers, mark that the turn just resolved.
+				// The actual transfer execution happens in _write() after
+				// sendUpdates() has fully returned.
+				if (this.pendingTransfers.size > 0) {
+					this.turnJustResolved = true;
+					console.log(`[TIMELINE DEBUG] Turn resolved with ${this.pendingTransfers.size} pending transfers — flagged for post-update execution`);
+				} else {
+					this.emitTimelineUpdate();
+				}
 			}
 		};
+	}
+
+	/**
+	 * Execute all pending transfers. Called AFTER sendUpdates() has fully
+	 * returned, so we're not inside the battle's send callback.
+	 */
+	private executePendingTransfers() {
+		if (this.pendingTransfers.size === 0) return;
+
+		console.log(`[TIMELINE DEBUG] Executing ${this.pendingTransfers.size} pending transfers after turn resolution`);
+
+		const transfers = new Map(this.pendingTransfers);
+		this.pendingTransfers.clear();
+
+		const battle = this.battle?.battle;
+		if (!battle) {
+			console.log(`[TIMELINE DEBUG] No battle found for transfer execution`);
+			return;
+		}
+
+		for (const [sideId, transfer] of transfers) {
+			console.log(`[TIMELINE DEBUG] Executing transfer: ${transfer.sideId} from ${transfer.sourceBattleId} -> ${transfer.targetGlobalId} turn ${transfer.targetTurn}`);
+
+			try {
+				this.executeTransfer(transfer);
+			} catch (err: any) {
+				console.log(`[TIMELINE DEBUG] Transfer execution failed: ${err.message}`);
+				console.log(`[TIMELINE DEBUG] Stack: ${err.stack}`);
+				this.pushMessage('update',
+					`|-message|Transfer failed for ${transfer.sideId}: ${err.message}`);
+			}
+		}
+
+		// After all transfers complete, we need to issue new requests.
+		// battle.makeRequest('move') internally calls:
+		//   1. side.clearChoice() for all sides
+		//   2. getRequests(type) which calls side.getRequestData()
+		//      which calls pokemon.getSwitchRequestData()
+		//      which accesses slotConditions[position]
+		//   3. side.emitRequest() via sendUpdates()
+		//
+		// We need to ensure slotConditions is valid for all sides before this.
+		// replaceTeamFromSnapshot already resets it for the transferred side,
+		// but let's be safe and check all sides.
+		for (const side of battle.sides) {
+			if (!side) continue;
+			// Ensure slotConditions has entries for all active slot positions
+			if (!side.slotConditions) {
+				side.slotConditions = [];
+			}
+			for (let i = 0; i < side.active.length; i++) {
+				if (!side.slotConditions[i]) {
+					side.slotConditions[i] = {};
+				}
+			}
+		}
+
+		// Now try makeRequest. If it still fails, we fall back to manually
+		// constructing and emitting requests.
+		try {
+			console.log(`[TIMELINE DEBUG] Issuing new move request after transfers`);
+			battle.makeRequest('move');
+			console.log(`[TIMELINE DEBUG] makeRequest succeeded`);
+		} catch (e: any) {
+			console.log(`[TIMELINE DEBUG] makeRequest threw: ${e.message}`);
+			console.log(`[TIMELINE DEBUG] Stack: ${e.stack}`);
+
+			// Fallback: manually set request state so the battle can continue.
+			// We set requestState to 'move' and clear choices, then build
+			// requests manually for each side.
+			try {
+				console.log(`[TIMELINE DEBUG] Attempting manual request fallback`);
+				battle.requestState = 'move';
+
+				for (const side of battle.sides) {
+					if (!side) continue;
+					side.clearChoice();
+
+					// Build a minimal request manually
+					const pokemon = side.pokemon.map((mon: any, i: number) => {
+						const isActive = i < side.active.length && side.active[i] === mon;
+						const condition = mon.fainted ? '0 fnt' :
+							`${mon.hp}/${mon.maxhp}${mon.status ? ` ${mon.status}` : ''}`;
+
+						return {
+							ident: `${side.id}: ${mon.name}`,
+							details: mon.details || `${mon.species.name}, L${mon.level}`,
+							condition: condition,
+							active: isActive,
+							stats: {
+								atk: mon.baseStoredStats?.['atk'] || 0,
+								def: mon.baseStoredStats?.['def'] || 0,
+								spa: mon.baseStoredStats?.['spa'] || 0,
+								spd: mon.baseStoredStats?.['spd'] || 0,
+								spe: mon.baseStoredStats?.['spe'] || 0,
+							},
+							moves: (mon.moves || mon.moveSlots?.map((m: any) => m.id) || []) as ID[],
+							baseAbility: mon.baseAbility || mon.ability || '',
+							item: mon.item || '',
+							pokeball: mon.pokeball || 'pokeball',
+							ability: mon.ability || '',
+							teraType: mon.teraType || '',
+							terastallized: mon.terastallized || '',
+						};
+					});
+
+					// Build active move data for the active pokemon
+					const activeMon = side.active[0];
+					let activeData: any[] = [];
+					if (activeMon && !activeMon.fainted) {
+						const moves = activeMon.moveSlots.map((moveSlot: any) => {
+							return {
+								move: moveSlot.move,
+								id: moveSlot.id,
+								pp: moveSlot.pp,
+								maxpp: moveSlot.maxpp,
+								target: moveSlot.target || 'normal',
+								disabled: moveSlot.disabled || false,
+							};
+						});
+
+						activeData = [{
+							moves: moves,
+							canDynamax: false,
+							canTerastallize: activeMon.teraType && !activeMon.terastallized ?
+								activeMon.teraType : undefined,
+						}];
+					}
+
+					const request: any = {
+						requestType: 'move',
+						active: activeData,
+						side: { name: side.name, id: side.id, pokemon },
+					};
+
+					// If this side has no active pokemon or it's fainted,
+					// they might need a force switch instead
+					if (!activeMon || activeMon.fainted) {
+						const hasAlive = side.pokemon.some((p: any) => !p.fainted && p.hp > 0);
+						if (hasAlive) {
+							request.requestType = 'switch';
+							request.forceSwitch = [true];
+							delete request.active;
+						} else {
+							request.wait = true;
+						}
+					}
+
+					side.activeRequest = request;
+				}
+
+				battle.sentRequests = false;
+				console.log(`[TIMELINE DEBUG] Manual request fallback completed`);
+			} catch (fallbackErr: any) {
+				console.log(`[TIMELINE DEBUG] Manual request fallback also failed: ${fallbackErr.message}`);
+				console.log(`[TIMELINE DEBUG] Stack: ${fallbackErr.stack}`);
+			}
+		}
+
+		// Flush updates (sends requests to players)
+		try {
+			battle.sendUpdates();
+		} catch (e: any) {
+			console.log(`[TIMELINE DEBUG] sendUpdates after transfer threw: ${e.message}`);
+		}
+
+		// Update timeline visualization
+		const entry = this.timelineRegistry.get(this.battle!.currentTimelineId);
+		if (entry) {
+			this.captureSnapshot(this.battle!.currentTimelineId, battle);
+		}
+		this.emitTimelineUpdate();
+	}
+
+	/**
+	 * Execute a single transfer operation.
+	 * Does NOT call makeRequest or sendUpdates — the caller handles that
+	 * after all transfers are done.
+	 */
+	private executeTransfer(transfer: {
+		sideId: 'p1' | 'p2' | 'p3' | 'p4';
+		sourceBattleId: string;
+		targetGlobalId: string;
+		targetTurn: number;
+	}) {
+		const { sideId, sourceBattleId, targetGlobalId, targetTurn } = transfer;
+
+		const resolvedTargetId = this.resolveManagerBattleId(targetGlobalId);
+		if (!resolvedTargetId) {
+			throw new Error(`Target battle "${targetGlobalId}" not found in manager`);
+		}
+
+		// Step 1: Capture the active Pokemon's state from the source battle
+		const transferState = this.manager.getPokemonTransferState(
+			sourceBattleId,
+			sideId as 'p1' | 'p2',
+			0
+		);
+		if (!transferState) {
+			throw new Error(`No active Pokemon to transfer`);
+		}
+		console.log(`[TIMELINE DEBUG] Captured transfer state for ${transferState.set.name || transferState.set.species}`);
+
+		// Step 2: Get the stored team from the target timeline node
+		const targetSide = sideId as 'p1' | 'p2';
+		const snapshotSets = this.getStoredSets(resolvedTargetId, targetTurn, targetSide);
+		const snapshotDisplays = this.getStoredSnapshots(resolvedTargetId, targetTurn, targetSide);
+
+		if (!snapshotSets || snapshotSets.length === 0) {
+			console.log(`[TIMELINE DEBUG] No stored sets found for target - using empty team`);
+		} else {
+			console.log(`[TIMELINE DEBUG] Found ${snapshotSets.length} stored sets for target timeline`);
+		}
+
+		// Step 3: Replace the team (does NOT call makeRequest/sendUpdates)
+		const result = this.manager.replaceTeamFromSnapshot(
+			sourceBattleId,
+			sideId as 'p1' | 'p2',
+			snapshotSets || [],
+			snapshotDisplays || [],
+			transferState
+		);
+
+		console.log(`[TIMELINE DEBUG] replaceTeamFromSnapshot result:`, JSON.stringify({
+			success: result.success,
+			error: result.error,
+			transferred: result.transferredPokemon?.set?.name,
+		}));
+
+		if (!result.success) {
+			throw new Error(result.error || 'Transfer failed');
+		}
+
+		const coord = `Timeline ${targetGlobalId}, Turn ${targetTurn}`;
+		this.pushMessage('update',
+			`|-message|${sideId}'s Pokemon transferred to ${coord}!`);
 	}
 
 	/** Emit a |timenodes| message with full tree state */
@@ -362,6 +640,9 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 	}
 
 	override _write(chunk: string) {
+		// Reset the flag before processing
+		this.turnJustResolved = false;
+
 		if (this.noCatch) {
 			this._writeLines(chunk);
 		} else {
@@ -375,6 +656,13 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 
 		if (this.battle) {
 			this.battle.sendUpdates();
+		}
+
+		// After sendUpdates() has fully returned (and the send callback
+		// has finished), check if we need to execute transfers.
+		if (this.turnJustResolved) {
+			this.turnJustResolved = false;
+			this.executePendingTransfers();
 		}
 	}
 
@@ -404,13 +692,11 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 		case 'start': {
 			const options = JSON.parse(message);
 
-			// The room ID IS the match ID. Period.
 			this.matchId = options.roomid || `match-${Date.now()}`;
 
 			console.log(`[TIMELINE DEBUG] Starting match: ${this.matchId}`);
 			console.log(`[TIMELINE DEBUG] Format: ${options.formatid}`);
 
-			// Root battle ID = match ID. No suffix.
 			const rootBattleId = this.getRootBattleId();
 
 			const battle = this.manager.createBattle(rootBattleId, {
@@ -419,17 +705,13 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 				debug: this.debug,
 			});
 
-			// Register: globalId = battleId = matchId for root
 			const timeline = this.registerTimeline(rootBattleId);
 			this.rootTimelineId = timeline.globalId;
 
-			// Also register the raw roomid -> manager battle ID mapping
-			// so room-battle.ts can find it by this.roomid
 			if (options.roomid && options.roomid !== rootBattleId) {
 				this.managedBattleIds.set(options.roomid, rootBattleId);
 			}
 
-			// Set up the MultiTimeBattle wrapper
 			if (!this.matchId) {
 				throw new Error('Failed to determine match ID');
 			}
@@ -442,10 +724,8 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 				battle,
 			};
 
-			// Hook send callback to capture snapshots and relay messages
 			this.hookBattleSend(timeline.globalId, battle);
 
-			// Initial tree state
 			this.emitTimelineUpdate();
 			break;
 		}
@@ -489,6 +769,79 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 				throw new Error(`Timeline ${this.battle.currentTimelineId} not registered`);
 			}
 
+			// ── Handle transfer commands ──
+			if (message.startsWith('transfer|')) {
+				console.log(`[TIMELINE DEBUG] Transfer choice received: ${sideId} ${message}`);
+				const transferParts = message.split('|');
+				const targetGlobalId = transferParts[1];
+				const targetTurn = parseInt(transferParts[2]);
+
+				if (!targetGlobalId || isNaN(targetTurn)) {
+					this.pushMessage('sideupdate',
+						`${sideId}\n|error|[Invalid transfer] Invalid timeline or turn`);
+					break;
+				}
+
+				// Store the transfer intent — do NOT execute it yet
+				this.pendingTransfers.set(sideId, {
+					sideId,
+					sourceBattleId: entry.battleId,
+					targetGlobalId,
+					targetTurn,
+				});
+
+				console.log(`[TIMELINE DEBUG] Transfer stored as pending for ${sideId}`);
+				console.log(`[TIMELINE DEBUG] Pending transfers: ${this.pendingTransfers.size}`);
+
+				// Submit a "pass" choice so the battle engine sees this side as done.
+				// The actual move doesn't matter because the transfer will replace
+				// the team after the turn resolves.
+				// We try "default" first (which picks a valid move), falling back to "pass".
+				const battle = this.manager.getBattle(entry.battleId);
+				if (!battle) {
+					this.pushMessage('sideupdate',
+						`${sideId}\n|error|[Invalid transfer] Battle not found`);
+					this.pendingTransfers.delete(sideId);
+					break;
+				}
+
+				try {
+					// Use "move 1" as the placeholder — "default" may not always work
+					// and we want the Pokemon to still take a turn action normally.
+					// The transfer happens AFTER the turn resolves.
+					const result = battle.choose(sideId, 'default');
+					if (!result) {
+						// If default fails, try move 1
+						console.log(`[TIMELINE DEBUG] 'default' failed for ${sideId}, trying 'move 1'`);
+						const result2 = battle.choose(sideId, 'move 1');
+						if (!result2) {
+							console.log(`[TIMELINE DEBUG] 'move 1' also failed, trying 'pass'`);
+							battle.choose(sideId, 'pass');
+						}
+					}
+				} catch (err: any) {
+					console.log(`[TIMELINE DEBUG] Placeholder choice failed: ${err.message}`);
+					// Last resort
+					try {
+						battle.choose(sideId, 'pass');
+					} catch (e2: any) {
+						console.log(`[TIMELINE DEBUG] Even pass failed: ${e2.message}`);
+						this.pendingTransfers.delete(sideId);
+						this.pushMessage('sideupdate',
+							`${sideId}\n|error|[Invalid transfer] Could not submit placeholder choice`);
+					}
+				}
+
+				// IMPORTANT: Do NOT call sendUpdates() here.
+				// If both sides have chosen, commitChoices() already ran inside
+				// battle.choose() above. The send callback (hookBattleSend) will
+				// detect pending transfers and execute them before flushing.
+				// If only one side has chosen, nothing happens yet — we wait for
+				// the other side's choice.
+				break;
+			}
+			// ── End transfer handling ──
+
 			console.log(`[TIMELINE DEBUG] Choice: ${sideId} ${message} (battle: ${entry.battleId})`);
 
 			try {
@@ -521,7 +874,6 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 				break;
 			}
 
-			// Deterministic branch ID
 			const newBattleId = this.getBranchBattleId();
 
 			try {
@@ -530,40 +882,37 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 					debug: this.debug,
 				});
 
-				// Link the battles in the manager
 				this.manager.linkBattles(currentEntry.battleId, newBattleId);
 
-				// Register the new timeline
 				const newTimeline = this.registerTimeline(
 					newBattleId,
 					currentEntry.num,
 					turn
 				);
 
-				// Copy parent snapshots up to the branch turn
 				const parentHistory = this.turnSnapshots.get(this.battle.currentTimelineId);
 				if (parentHistory) {
 					const newHistory = new Map<number, {
 						p1Team: PokemonSnapshot[];
 						p2Team: PokemonSnapshot[];
+						p1Sets: PokemonSet[];
+						p2Sets: PokemonSet[];
 					}>();
 					for (const [t, snap] of parentHistory) {
 						if (t <= turn) {
-							// Deep copy each team array so mutation doesn't
-							// bleed between timelines
 							newHistory.set(t, {
 								p1Team: snap.p1Team.map(p => ({ ...p })),
 								p2Team: snap.p2Team.map(p => ({ ...p })),
+								p1Sets: snap.p1Sets ? [...snap.p1Sets] : [],
+								p2Sets: snap.p2Sets ? [...snap.p2Sets] : [],
 							});
 						}
 					}
 					this.turnSnapshots.set(newTimeline.globalId, newHistory);
 				}
 
-				// Hook the new battle's send
 				this.hookBattleSend(newTimeline.globalId, newBattle);
 
-				// Switch to the new branch
 				this.battle.currentTimelineId = newTimeline.globalId;
 				this.battle.currentTimeline = {
 					...newTimeline,
@@ -591,13 +940,10 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 			const battle = this.manager.getBattle(entry.battleId);
 			const currentTurn = battle?.turn ?? 0;
 
-			// Always re-capture the latest state so the current turn is fresh
 			if (battle) this.captureSnapshot(globalId, battle);
 
 			const history = this.turnSnapshots.get(globalId);
 
-			// No history yet: emit a placeholder turn-0 node so the
-			// timeline appears in the tree immediately
 			if (!history || history.size === 0) {
 				allNodes.push({
 					timelineId: globalId,
@@ -648,7 +994,6 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 
 	/**
 	 * Get the stored PokemonSets for a specific timeline at a specific turn.
-	 * Used by room-battle.ts when executing a transfer.
 	 */
 	getStoredSets(
 		timelineId: string,
@@ -661,7 +1006,6 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 			return null;
 		}
 
-		// Find the closest turn at or before the requested turn
 		let closestTurn = -1;
 		for (const [t] of history) {
 			if (t <= turn && t > closestTurn) closestTurn = t;
@@ -680,7 +1024,6 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 
 	/**
 	 * Get the stored PokemonSnapshot for a specific timeline at a specific turn.
-	 * Used alongside getStoredSets to get HP/status at that point in time.
 	 */
 	getStoredSnapshots(
 		timelineId: string,

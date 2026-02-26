@@ -883,12 +883,16 @@ export class MultiBattleManager {
 	/**
 	 * Replaces a side's team with a stored team snapshot from a timeline node,
 	 * then adds the transferred Pokemon as the new active Pokemon.
+	 * 
+	 * NOTE: This method does NOT call makeRequest() or sendUpdates().
+	 * The caller (MultiTimeBattleStream) is responsible for triggering
+	 * new requests and flushing updates after all transfers are complete.
 	 */
 	replaceTeamFromSnapshot(
 		battleId: string,
 		side: 'p1' | 'p2',
-		snapshotSets: PokemonSet[],           // full sets from getStoredSets()
-		snapshotDisplays: PokemonSnapshot[],  // hp/status from getStoredSnapshots()
+		snapshotSets: PokemonSet[],
+		snapshotDisplays: PokemonSnapshot[],
 		transferredState: PokemonTransferState
 	): TransferResult {
 		console.log(`[Timeline Team] replaceTeamFromSnapshot("${battleId}", "${side}")`);
@@ -902,18 +906,17 @@ export class MultiBattleManager {
 		const battleSide = battle[side];
 		if (!battleSide) return { success: false, error: `Invalid side "${side}"` };
 
-		// Build a display lookup by species for quick HP/status access
+		// Build a display lookup by name/species for HP/status
 		const displayByName = new Map<string, PokemonSnapshot>();
 		for (const d of snapshotDisplays) {
 			displayByName.set(d.name.toLowerCase(), d);
 			displayByName.set(d.species.toLowerCase(), d);
 		}
 
-		// ── STEP 1: Record old active name for protocol ──
 		const oldActiveName = battleSide.active[0]?.name || 'unknown';
 		console.log(`[Timeline Team] Old active: ${oldActiveName}`);
 
-		// ── STEP 2: Faint all existing Pokemon ──
+		// ── STEP 1: Faint all existing Pokemon ──
 		for (const pokemon of battleSide.pokemon) {
 			pokemon.fainted = true;
 			pokemon.faintQueued = false;
@@ -923,13 +926,31 @@ export class MultiBattleManager {
 		}
 		battleSide.active[0] = null as any;
 
-		// ── STEP 3: Clear team arrays ──
+		// ── STEP 2: Clear team arrays ──
 		battleSide.pokemon = [];
 		battleSide.team = [];
 		battleSide.pokemonLeft = 0;
-		console.log(`[Timeline Team] Team cleared`);
 
-		// ── STEP 4: Rebuild from snapshot sets ──
+		// ── STEP 3: Reset slotConditions for all active slots ──
+		// This prevents the revivalblessing crash in getSwitchRequestData
+		battleSide.slotConditions = [];
+		for (let i = 0; i < battleSide.active.length; i++) {
+			battleSide.slotConditions[i] = {};
+		}
+		console.log(`[Timeline Team] Team cleared, slotConditions reset (${battleSide.active.length} slots)`);
+
+		// ── STEP 4: Add the transferred Pokemon FIRST (position 0) ──
+		// This ensures it's at position 0 which the battle engine considers
+		// the active slot for singles.
+		const completeTransferSet = ensureCompletePokemonSet(transferredState.set);
+		const transferredPokemon = battleSide.addPokemon(completeTransferSet);
+		if (!transferredPokemon) {
+			return { success: false, error: `Failed to add transferred Pokemon` };
+		}
+		this.applyPokemonState(transferredPokemon, transferredState, battle);
+		console.log(`[Timeline Team] Transferred Pokemon added at position 0: ${transferredPokemon.name} HP ${transferredPokemon.hp}/${transferredPokemon.maxhp}`);
+
+		// ── STEP 5: Rebuild bench from snapshot sets ──
 		for (const set of snapshotSets) {
 			const completeSet = ensureCompletePokemonSet(set);
 			const pokemon = battleSide.addPokemon(completeSet);
@@ -950,7 +971,6 @@ export class MultiBattleManager {
 					battleSide.pokemonLeft--;
 					console.log(`[Timeline Team]   ${pokemon.name} - fainted (from snapshot)`);
 				} else {
-					// display.hp is a percentage
 					pokemon.hp = Math.max(1, Math.round((display.hp / 100) * pokemon.maxhp));
 					if (display.status) pokemon.setStatus(display.status as any);
 					console.log(`[Timeline Team]   ${pokemon.name} HP: ${pokemon.hp}/${pokemon.maxhp} (${display.hp}%)`);
@@ -960,28 +980,41 @@ export class MultiBattleManager {
 			}
 		}
 
-		// ── STEP 5: Add the transferred Pokemon ──
-		const completeTransferSet = ensureCompletePokemonSet(transferredState.set);
-		const transferredPokemon = battleSide.addPokemon(completeTransferSet);
-		if (!transferredPokemon) {
-			return { success: false, error: `Failed to add transferred Pokemon` };
-		}
-		this.applyPokemonState(transferredPokemon, transferredState, battle);
-		console.log(`[Timeline Team] Transferred Pokemon: ${transferredPokemon.name} HP ${transferredPokemon.hp}/${transferredPokemon.maxhp}`);
-
-		// ── STEP 6: Switch in the transferred Pokemon ──
+		// ── STEP 6: Switch in the transferred Pokemon (position 0) ──
+		// The transferred Pokemon is at index 0 in the pokemon array.
+		// We need to properly set it as the active Pokemon.
 		try {
 			battle.actions.switchIn(transferredPokemon, 0);
-			console.log(`[Timeline Team] Switched in ${transferredPokemon.name}`);
+			console.log(`[Timeline Team] Switched in ${transferredPokemon.name} via battle.actions.switchIn`);
 		} catch (e: any) {
 			console.log(`[Timeline Team] switchIn threw: ${e.message}, using manual fallback`);
 			battleSide.active[0] = transferredPokemon;
 			transferredPokemon.isActive = true;
 			transferredPokemon.activeTurns = 0;
 			transferredPokemon.activeMoveActions = 0;
+			transferredPokemon.position = 0;
 		}
 
-		// ── STEP 7: Reset choice state ──
+		// ── STEP 7: Verify positions are correct ──
+		// addPokemon sets position = pokemon.length at time of add.
+		// Position 0 = transferred mon (active), positions 1+ = bench.
+		// Make sure active[0] is set correctly.
+		if (!battleSide.active[0] || battleSide.active[0].fainted) {
+			console.log(`[Timeline Team] Active slot still empty after switchIn, forcing manually`);
+			battleSide.active[0] = transferredPokemon;
+			transferredPokemon.isActive = true;
+			transferredPokemon.position = 0;
+		}
+
+		// Ensure slotConditions has entries for all active positions
+		// (should already be done in step 3 but double-check)
+		for (let i = 0; i < battleSide.active.length; i++) {
+			if (!battleSide.slotConditions[i]) {
+				battleSide.slotConditions[i] = {};
+			}
+		}
+
+		// ── STEP 8: Reset choice state ──
 		battleSide.choice = {
 			cantUndo: false,
 			error: '',
@@ -996,48 +1029,15 @@ export class MultiBattleManager {
 			terastallize: false,
 		};
 
-		// ── STEP 8: New move request ──
-		try {
-			if (typeof battle.makeRequest === 'function') {
-				battle.makeRequest('move');
-				console.log(`[Timeline Team] Move request sent`);
-			}
-		} catch (e: any) {
-			console.log(`[Timeline Team] makeRequest threw: ${e.message}`);
-		}
-
-		// ── STEP 9: Flush updates ──
-		try {
-			battle.sendUpdates();
-			console.log(`[Timeline Team] Updates flushed`);
-		} catch (e: any) {
-			console.log(`[Timeline Team] sendUpdates threw: ${e.message}`);
-		}
-
 		console.log(`[Timeline Team] Final team state for ${side}:`);
-		for (const pokemon of battleSide.pokemon) {
-			console.log(`[Timeline Team]   ${pokemon.name} | HP: ${pokemon.hp}/${pokemon.maxhp} | Active: ${pokemon.isActive} | Fainted: ${pokemon.fainted}`);
+		for (let i = 0; i < battleSide.pokemon.length; i++) {
+			const pokemon = battleSide.pokemon[i];
+			console.log(`[Timeline Team]   [${i}] pos=${pokemon.position} ${pokemon.name} | HP: ${pokemon.hp}/${pokemon.maxhp} | Active: ${pokemon.isActive} | Fainted: ${pokemon.fainted}`);
 		}
+		console.log(`[Timeline Team]   active[0]: ${battleSide.active[0]?.name || 'EMPTY'}`);
+		console.log(`[Timeline Team]   pokemonLeft: ${battleSide.pokemonLeft}`);
 
 		return { success: true, transferredPokemon: transferredState };
-	}
-
-	/**
-	 * Reconstructs a minimal PokemonSet from a PokemonSnapshot.
-	 * PokemonSnapshot only stores name/species/hp/status/isActive/fainted,
-	 * so this produces a set suitable for addPokemon - the snapshot HP
-	 * is applied separately after creation.
-	 */
-	private _reconstructSetFromSnapshot(snap: { name: string; species: string }): PokemonSet | null {
-		if (!snap.species && !snap.name) return null;
-
-		return ensureCompletePokemonSet({
-			name: snap.name,
-			species: snap.species,
-			// moves/item/ability/EVs/IVs will get defaults from ensureCompletePokemonSet
-			// The actual move data comes from the battle's format/random team generation
-			// For a proper implementation these would come from the stored team sets
-		});
 	}
 
 	/**

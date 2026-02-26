@@ -652,6 +652,7 @@ export class RoomBattle extends RoomGame<RoomBattlePlayer> {
 		this.active = active;
 		if (Rooms.global.battleCount === 0) Rooms.global.automaticKillRequest();
 	}
+
 	override choose(user: User, data: string) {
 		if (this.frozen) {
 			user.popup(`Your battle is currently paused, so you cannot move right now.`);
@@ -688,16 +689,14 @@ export class RoomBattle extends RoomGame<RoomBattlePlayer> {
 				return;
 			}
 
+			// Mark as waiting — the stream will handle execution after turn resolution
 			request.isWait = true;
-			const result = this.queueTransfer(player, targetGlobalId, targetTurnNum);
-			console.log(`[TRANSFER DEBUG] queueTransfer result:`, JSON.stringify(result));
-			if (!result.success) {
-				request.isWait = false;
-				player.sendRoom(`|error|[Invalid transfer] ${result.error}`);
-				return;
-			}
 			request.choice = `transfer|${targetGlobalId}|${targetTurnNum}`;
-			player.sendRoom(`|message|Transfer queued to ${result.targetCoord}`);
+
+			// Send through the stream — this is processed like any other choice
+			void this.stream.write(`>${player.slot} transfer|${targetGlobalId}|${targetTurnNum}`);
+
+			player.sendRoom(`|message|Transfer queued — will execute after this turn resolves.`);
 			return;
 		}
 
@@ -725,6 +724,7 @@ export class RoomBattle extends RoomGame<RoomBattlePlayer> {
 
 		void this.stream.write(`>${player.slot} ${choice}`);
 	}
+
 	override undo(user: User, data: string) {
 		const player = this.playerTable[user.id];
 		const [, rqid] = data.split('|', 2);
@@ -902,7 +902,47 @@ export class RoomBattle extends RoomGame<RoomBattlePlayer> {
 				request.choice = '';
 			} else if (lines[2].startsWith(`|request|`)) {
 				this.rqid++;
-				const request = JSON.parse(lines[2].slice(9));
+				const requestJSON = lines[2].slice(9);
+				
+				// Guard against null/empty request data
+				// This can happen during transfers when the battle state is being rebuilt
+				if (!requestJSON || requestJSON === 'null' || requestJSON === '') {
+					console.log(`[TRANSFER DEBUG] Received null/empty request for ${slot}, skipping rqid assignment`);
+					// Still mark the player as not waiting so they can act next turn
+					this[slot].request = {
+						rqid: this.rqid,
+						request: '',
+						isWait: 'cantUndo',
+						choice: '',
+					};
+					break;
+				}
+				
+				let request;
+				try {
+					request = JSON.parse(requestJSON);
+				} catch (e) {
+					console.log(`[TRANSFER DEBUG] Failed to parse request JSON for ${slot}: ${requestJSON}`);
+					this[slot].request = {
+						rqid: this.rqid,
+						request: '',
+						isWait: 'cantUndo',
+						choice: '',
+					};
+					break;
+				}
+				
+				if (!request) {
+					console.log(`[TRANSFER DEBUG] Parsed request is null/falsy for ${slot}`);
+					this[slot].request = {
+						rqid: this.rqid,
+						request: '',
+						isWait: 'cantUndo',
+						choice: '',
+					};
+					break;
+				}
+				
 				request.rqid = this.rqid;
 				
 				// Add transfer targets if this is a timeline-enabled battle and we're in move phase
@@ -913,15 +953,15 @@ export class RoomBattle extends RoomGame<RoomBattlePlayer> {
 					}
 				}
 				
-				const requestJSON = JSON.stringify(request);
+				const requestJSONFinal = JSON.stringify(request);
 				this[slot].request = {
 					rqid: this.rqid,
-					request: requestJSON,
+					request: requestJSONFinal,
 					isWait: request.wait ? 'cantUndo' : false,
 					choice: '',
 				};
 				this.requestCount++;
-				player?.sendRoom(`|request|${requestJSON}`);
+				player?.sendRoom(`|request|${requestJSONFinal}`);
 				if (!request.update) this.timer.nextRequest(player);
 				break;
 			}
@@ -1514,129 +1554,29 @@ export class RoomBattle extends RoomGame<RoomBattlePlayer> {
 			return [];
 		}
 	}
-
-	/**
-	 * Queue a Pokémon transfer to a specific timeline node.
-	 * Called when player chooses a transfer option.
-	 */
-	queueTransfer(
-		player: RoomBattlePlayer,
-		targetBattleId: string,
-		targetTurn: number
-	): { success: boolean; error?: string; targetCoord?: string } {
-		const manager = (global as any).__MULTI_BATTLE_MANAGER as MultiBattleManager | undefined;
-		if (!manager) {
-			return { success: false, error: 'Timeline manager not available' };
-		}
-
-		const resolvedSourceId = this.resolveManagerBattleId(this.roomid);
-		const resolvedTargetId = this.resolveManagerBattleId(targetBattleId);
-
-		console.log(`[TRANSFER DEBUG] queueTransfer called`);
-		console.log(`[TRANSFER DEBUG]   this.roomid: "${this.roomid}"`);
-		console.log(`[TRANSFER DEBUG]   resolvedSourceId: "${resolvedSourceId}"`);
-		console.log(`[TRANSFER DEBUG]   targetBattleId (raw): "${targetBattleId}"`);
-		console.log(`[TRANSFER DEBUG]   resolvedTargetId: "${resolvedTargetId}"`);
-		console.log(`[TRANSFER DEBUG]   targetTurn: ${targetTurn}`);
-		console.log(`[TRANSFER DEBUG]   player: ${player.slot}`);
-		console.log(`[TRANSFER DEBUG]   manager.battles keys: [${manager.getBattleIds().join(', ')}]`);
-
-		if (!resolvedSourceId) {
-			return { success: false, error: `Source battle "${this.roomid}" not found in manager` };
-		}
-		if (!resolvedTargetId) {
-			return { success: false, error: `Target battle "${targetBattleId}" not found in manager` };
-		}
-
-		// ── Step 1: Capture the active Pokemon's state from the source battle ──
-		const transferState = manager.getPokemonTransferState(
-			resolvedSourceId,
-			player.slot as 'p1' | 'p2',
-			0
-		);
-		if (!transferState) {
-			return { success: false, error: `No active Pokemon to transfer` };
-		}
-		console.log(`[TRANSFER DEBUG] Captured transfer state for ${transferState.set.name || transferState.set.species}`);
-
-		// ── Step 2: Get the stored team from the target timeline node ──
-		const stream = this.stream as MultiTimeBattleStream;
-		if (!('getStoredSets' in stream)) {
-			return { success: false, error: `Stream does not support getStoredSets` };
-		}
-
-		const targetSide = player.slot as 'p1' | 'p2';
-		const snapshotSets = stream.getStoredSets(resolvedTargetId, targetTurn, targetSide);
-		const snapshotDisplays = stream.getStoredSnapshots(resolvedTargetId, targetTurn, targetSide);
-
-		if (!snapshotSets || snapshotSets.length === 0) {
-			console.log(`[TRANSFER DEBUG] No stored sets found for target - using empty team`);
-		} else {
-			console.log(`[TRANSFER DEBUG] Found ${snapshotSets.length} stored sets for target timeline`);
-		}
-
-		// ── Step 3: Replace the team in the source battle with the target ──
-		// snapshot team, and add the transferred Pokemon as active
-		const result = manager.replaceTeamFromSnapshot(
-			resolvedSourceId,
-			player.slot as 'p1' | 'p2',
-			snapshotSets || [],
-			snapshotDisplays || [],
-			transferState
-		);
-
-		console.log(`[TRANSFER DEBUG] replaceTeamFromSnapshot result:`, JSON.stringify({
-			success: result.success,
-			error: result.error,
-			transferred: result.transferredPokemon?.set?.name,
-		}));
-
-		if (!result.success) {
-			return { success: false, error: result.error || 'Transfer failed' };
-		}
-
-		const coord = `Timeline ${targetBattleId}, Turn ${targetTurn}`;
-		return { success: true, targetCoord: coord };
-	}
 }
 
-export class RoomBattleStream extends BattleStream {
-	override readonly battle: Battle;
-	constructor() {
-		super({ keepAlive: true });
-		this.battle = null!;
-	}
-
-	override _write(chunk: string) {
-		const startTime = Date.now();
-		if (this.battle && Config.debugsimprocesses && process.send) {
-			process.send('DEBUG\n' + this.battle.inputLog.join('\n') + '\n' + chunk);
+	export class RoomBattleStream extends BattleStream {
+		override readonly battle: Battle;
+		constructor() {
+			super({ keepAlive: true });
+			this.battle = null!;
 		}
-		try {
+
+		override _write(chunk: string) {
+		if (this.noCatch) {
 			this._writeLines(chunk);
-		} catch (err: any) {
-			const battle = this.battle;
-			Monitor.crashlog(err, 'A battle', {
-				chunk,
-				inputLog: battle ? '\n' + battle.inputLog.join('\n') : '',
-				log: battle ? '\n' + battle.getDebugLog() : '',
-			});
-
-			this.push(`update\n|html|<div class="broadcast-red"><b>The battle crashed</b><br />Don't worry, we're working on fixing it.</div>`);
-			if (battle) {
-				for (const side of battle.sides) {
-					if (side?.requestState) {
-						this.push(`sideupdate\n${side.id}\n|error|[Invalid choice] The battle crashed`);
-					}
-				}
+		} else {
+			try {
+				this._writeLines(chunk);
+			} catch (err: any) {
+				this.pushError(err, true);
+				return;
 			}
-			// public crashlogs only have the stack anyways
-			this.push(`error\n${err.stack}`);
 		}
-		if (this.battle) this.battle.sendUpdates();
-		const deltaTime = Date.now() - startTime;
-		if (deltaTime > 1000) {
-			Monitor.slow(`[slow battle] ${deltaTime}ms - ${chunk.replace(/\n/ig, ' | ')}`);
+
+		if (this.battle) {
+			this.battle.sendUpdates();
 		}
 	}
 }

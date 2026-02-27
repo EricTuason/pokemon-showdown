@@ -213,6 +213,12 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 	}> = new Map();
 	private timelineCounter = 0;
 	private turnJustResolved = false;
+	/**
+	 * Timelines that have been superseded by a transfer and share their
+	 * backing battle with a newer branch. They cannot be played independently
+	 * and should not receive new snapshots or be selected as current.
+	 */
+	private frozenTimelineIds: Set<string> = new Set();
 
 	/**
 	 * Pending transfers: keyed by sideId. Only one transfer per side per turn.
@@ -587,7 +593,7 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 			throw new Error(`Target battle "${targetGlobalId}" not found in manager`);
 		}
 
-		// Step 1: Capture the active Pokemon's state from the source battle
+		// Capture the active Pokemon's state from the source battle
 		const transferState = this.manager.getPokemonTransferState(
 			sourceBattleId,
 			sideId as 'p1' | 'p2',
@@ -598,10 +604,10 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 		}
 		console.log(`[TIMELINE DEBUG] Captured transfer state for ${transferState.set.name || transferState.set.species}`);
 
-		// Step 2: Get the stored team from the target timeline node
+		// turnSnapshots is keyed by globalId, not the manager's internal battleId
 		const targetSide = sideId as 'p1' | 'p2';
-		const snapshotSets = this.getStoredSets(resolvedTargetId, targetTurn, targetSide);
-		const snapshotDisplays = this.getStoredSnapshots(resolvedTargetId, targetTurn, targetSide);
+		const snapshotSets = this.getStoredSets(targetGlobalId, targetTurn, targetSide);
+		const snapshotDisplays = this.getStoredSnapshots(targetGlobalId, targetTurn, targetSide);
 
 		if (!snapshotSets || snapshotSets.length === 0) {
 			console.log(`[TIMELINE DEBUG] No stored sets found for target - using empty team`);
@@ -609,7 +615,7 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 			console.log(`[TIMELINE DEBUG] Found ${snapshotSets.length} stored sets for target timeline`);
 		}
 
-		// Step 3: Replace the team (does NOT call makeRequest/sendUpdates)
+		// Replace the source battle's team with the target's snapshot + transferred Pokemon
 		const result = this.manager.replaceTeamFromSnapshot(
 			sourceBattleId,
 			sideId as 'p1' | 'p2',
@@ -628,9 +634,82 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 			throw new Error(result.error || 'Transfer failed');
 		}
 
+		// The source timeline shares its backing battle with the new branch,
+		// so it cannot be played independently going forward
+		if (this.battle?.currentTimelineId) {
+			this.frozenTimelineIds.add(this.battle.currentTimelineId);
+			console.log(`[TIMELINE DEBUG] Froze timeline: ${this.battle.currentTimelineId}`);
+		}
+
+		// The target timeline entry tells us which timeline number to parent
+		// the new branch under, analogous to `git checkout -b <new> <commit>`.
+		const targetEntry = this.timelineRegistry.get(targetGlobalId);
+		if (!targetEntry) {
+			throw new Error(`Target timeline "${targetGlobalId}" not in registry`);
+		}
+
+		// Create the branch registry entry directly. registerTimeline() cannot
+		// be used here because it derives globalId from battleId, and the source
+		// battle already owns a registry entry under its battleId — calling
+		// registerTimeline(sourceBattleId, …) would overwrite that entry.
+		this.timelineCounter++;
+		const branchGlobalId = `${this.matchId}>>branch${this.timelineCounter}`;
+
+		const branchEntry = {
+			battleId: sourceBattleId,
+			num: this.timelineCounter,
+			parentNum: targetEntry.num,
+			fromTurn: targetTurn,
+			globalId: branchGlobalId,
+		};
+		this.timelineRegistry.set(branchGlobalId, branchEntry);
+		this.managedBattleIds.set(branchGlobalId, sourceBattleId);
+
+		console.log(`[TIMELINE DEBUG] Registered branch: globalId="${branchGlobalId}" (num=${branchEntry.num}, parent=#${targetEntry.num}, fromTurn=${targetTurn})`);
+
+		// Seed the branch's snapshot history from the target timeline,
+		// including every turn up to and including the branch point.
+		const targetHistory = this.turnSnapshots.get(targetGlobalId);
+		if (targetHistory) {
+			const branchHistory = new Map<number, {
+				p1Team: PokemonSnapshot[];
+				p2Team: PokemonSnapshot[];
+				p1Sets: PokemonSet[];
+				p2Sets: PokemonSet[];
+			}>();
+			for (const [t, snap] of targetHistory) {
+				if (t <= targetTurn) {
+					branchHistory.set(t, {
+						p1Team: snap.p1Team.map(p => ({ ...p })),
+						p2Team: snap.p2Team.map(p => ({ ...p })),
+						p1Sets: snap.p1Sets ? [...snap.p1Sets] : [],
+						p2Sets: snap.p2Sets ? [...snap.p2Sets] : [],
+					});
+				}
+			}
+			this.turnSnapshots.set(branchGlobalId, branchHistory);
+			console.log(`[TIMELINE DEBUG] Copied ${branchHistory.size} turn snapshots from target timeline`);
+		}
+
+		// Point the battle's send callback at the new branch so future
+		// snapshots are recorded under the branch's timeline ID
+		const sourceBattle = this.manager.getBattle(sourceBattleId);
+		this.hookBattleSend(branchGlobalId, sourceBattle);
+
+		// Switch the active timeline to the new branch
+		if (this.battle) {
+			this.battle.currentTimelineId = branchGlobalId;
+			this.battle.currentTimeline = {
+				...branchEntry,
+				battle: sourceBattle,
+			};
+		}
+
+		this.manager.linkBattles(resolvedTargetId, sourceBattleId);
+
 		const coord = `Timeline ${targetGlobalId}, Turn ${targetTurn}`;
 		this.pushMessage('update',
-			`|-message|${sideId}'s Pokemon transferred to ${coord}!`);
+			`|-message|${sideId}'s Pokemon transferred to ${coord}! New branch #${branchEntry.num} created.`);
 	}
 
 	/** Emit a |timenodes| message with full tree state */
@@ -793,10 +872,6 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 				console.log(`[TIMELINE DEBUG] Transfer stored as pending for ${sideId}`);
 				console.log(`[TIMELINE DEBUG] Pending transfers: ${this.pendingTransfers.size}`);
 
-				// Submit a "pass" choice so the battle engine sees this side as done.
-				// The actual move doesn't matter because the transfer will replace
-				// the team after the turn resolves.
-				// We try "default" first (which picks a valid move), falling back to "pass".
 				const battle = this.manager.getBattle(entry.battleId);
 				if (!battle) {
 					this.pushMessage('sideupdate',
@@ -805,39 +880,30 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 					break;
 				}
 
-				try {
-					// Use "move 1" as the placeholder — "default" may not always work
-					// and we want the Pokemon to still take a turn action normally.
-					// The transfer happens AFTER the turn resolves.
-					const result = battle.choose(sideId, 'default');
-					if (!result) {
-						// If default fails, try move 1
-						console.log(`[TIMELINE DEBUG] 'default' failed for ${sideId}, trying 'move 1'`);
-						const result2 = battle.choose(sideId, 'move 1');
-						if (!result2) {
-							console.log(`[TIMELINE DEBUG] 'move 1' also failed, trying 'pass'`);
-							battle.choose(sideId, 'pass');
-						}
-					}
-				} catch (err: any) {
-					console.log(`[TIMELINE DEBUG] Placeholder choice failed: ${err.message}`);
-					// Last resort
-					try {
-						battle.choose(sideId, 'pass');
-					} catch (e2: any) {
-						console.log(`[TIMELINE DEBUG] Even pass failed: ${e2.message}`);
-						this.pendingTransfers.delete(sideId);
-						this.pushMessage('sideupdate',
-							`${sideId}\n|error|[Invalid transfer] Could not submit placeholder choice`);
-					}
+				// The transferring side should not actually perform a move this turn.
+				// We manually mark the choice as complete with only a pass action, which
+				// the battle engine treats as a no-op. We bypass battle.choose() because
+				// it validates pass only for empty slots. Instead we construct the choice
+				// directly and call commitChoices if both sides are done.
+				const side = battle[sideId];
+				if (!side) {
+					this.pushMessage('sideupdate',
+						`${sideId}\n|error|[Invalid transfer] Side not found`);
+					this.pendingTransfers.delete(sideId);
+					break;
 				}
 
-				// IMPORTANT: Do NOT call sendUpdates() here.
-				// If both sides have chosen, commitChoices() already ran inside
-				// battle.choose() above. The send callback (hookBattleSend) will
-				// detect pending transfers and execute them before flushing.
-				// If only one side has chosen, nothing happens yet — we wait for
-				// the other side's choice.
+				side.clearChoice();
+				side.choice.actions.push({
+					choice: 'pass',
+				} as any);
+				side.choice.cantUndo = true;
+
+				// If all sides have now chosen, manually trigger turn resolution.
+				// battle.allChoicesDone() checks if every side's choice is complete.
+				if (battle.allChoicesDone()) {
+					battle.commitChoices();
+				}
 				break;
 			}
 			// ── End transfer handling ──
@@ -934,13 +1000,70 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 	private _getTimelineNodes(): { nodes: TimelineNodeData[] } {
 		if (!this.matchId) return { nodes: [] };
 
+		// Only capture a new snapshot for the timeline that is actively
+		// being played. Other timelines' snapshot histories are left as-is
+		// so they don't grow when the shared backing battle advances.
+		const activeId = this.battle?.currentTimelineId || '';
+		if (activeId) {
+			const activeEntry = this.timelineRegistry.get(activeId);
+			if (activeEntry) {
+				const activeBattle = this.manager.getBattle(activeEntry.battleId);
+				if (activeBattle) this.captureSnapshot(activeId, activeBattle);
+			}
+		}
+
+		// Determine which timeline should be marked as "current":
+		// among non-frozen, non-ended timelines, pick the one whose latest
+		// snapshot is at the lowest turn. Ties broken by lowest timeline number.
+		let computedCurrentId = '';
+		let bestMaxTurn = Infinity;
+		let bestNum = Infinity;
+
+		for (const [globalId, entry] of this.timelineRegistry) {
+			if (this.frozenTimelineIds.has(globalId)) continue;
+			const battle = this.manager.getBattle(entry.battleId);
+			if (!battle || battle.ended) continue;
+
+			const history = this.turnSnapshots.get(globalId);
+			let maxTurn = 0;
+			if (history) {
+				for (const [t] of history) {
+					if (t > maxTurn) maxTurn = t;
+				}
+			}
+
+			if (maxTurn < bestMaxTurn ||
+				(maxTurn === bestMaxTurn && entry.num < bestNum)) {
+				bestMaxTurn = maxTurn;
+				bestNum = entry.num;
+				computedCurrentId = globalId;
+			}
+		}
+
+		// If the computed current differs from what the stream is tracking,
+		// switch the active timeline so future choices and snapshots go
+		// to the right place
+		if (computedCurrentId && this.battle &&
+			this.battle.currentTimelineId !== computedCurrentId) {
+			const entry = this.timelineRegistry.get(computedCurrentId);
+			const battle = entry ? this.manager.getBattle(entry.battleId) : null;
+			if (entry && battle) {
+				console.log(`[TIMELINE DEBUG] Auto-switching current: ` +
+					`${this.battle.currentTimelineId} -> ${computedCurrentId}`);
+				this.battle.currentTimelineId = computedCurrentId;
+				this.battle.currentTimeline = { ...entry, battle };
+				this.hookBattleSend(computedCurrentId, battle);
+			}
+		}
+
+		if (!computedCurrentId) computedCurrentId = activeId;
+
+		// Build the node list
 		const allNodes: TimelineNodeData[] = [];
 
 		for (const [globalId, entry] of this.timelineRegistry) {
 			const battle = this.manager.getBattle(entry.battleId);
-			const currentTurn = battle?.turn ?? 0;
-
-			if (battle) this.captureSnapshot(globalId, battle);
+			const isFrozen = this.frozenTimelineIds.has(globalId);
 
 			const history = this.turnSnapshots.get(globalId);
 
@@ -952,8 +1075,8 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 					parentTimelineId: entry.parentNum
 						? this.findGlobalIdByNum(entry.parentNum) : null,
 					branchTurn: entry.fromTurn,
-					isCurrent: this.battle?.currentTimelineId === globalId,
-					ended: battle?.ended ?? false,
+					isCurrent: computedCurrentId === globalId,
+					ended: (battle?.ended ?? false) || isFrozen,
 					p1Team: [],
 					p2Team: [],
 				});
@@ -963,6 +1086,12 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 			const parentGlobalId = entry.parentNum
 				? this.findGlobalIdByNum(entry.parentNum) : null;
 
+			// The latest turn in this timeline's history
+			let maxTurn = 0;
+			for (const [t] of history) {
+				if (t > maxTurn) maxTurn = t;
+			}
+
 			for (const [turn, snap] of history) {
 				allNodes.push({
 					timelineId: globalId,
@@ -970,9 +1099,8 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 					turn,
 					parentTimelineId: parentGlobalId,
 					branchTurn: entry.fromTurn,
-					isCurrent: this.battle?.currentTimelineId === globalId
-						&& turn === currentTurn,
-					ended: battle?.ended ?? false,
+					isCurrent: computedCurrentId === globalId && turn === maxTurn,
+					ended: (battle?.ended ?? false) || isFrozen,
 					p1Team: snap.p1Team,
 					p2Team: snap.p2Team,
 				});

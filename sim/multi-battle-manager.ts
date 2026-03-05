@@ -110,12 +110,15 @@ export interface SideSnapshot {
 	team: PokemonSnapshot[];
 }
 
+/**
+ * Full Pokemon snapshot - stored internally for state restoration.
+ * Contains all data needed to restore a Pokemon's state.
+ */
 export interface PokemonSnapshot {
 	name: string;
 	species: string;
-	hp: number;
-	maxhp: number;
-	hpPercent: number;
+	hp: number;           // Stored as percentage (0-100)
+	maxhp: number;        // Actual max HP value
 	status: string;
 	fainted: boolean;
 	isActive: boolean;
@@ -125,6 +128,37 @@ export interface PokemonSnapshot {
 	moves: string[];
 	position: number;
 	volatiles: string[];
+}
+
+/**
+ * Minimal Pokemon snapshot - sent to client for UI display.
+ * Reduces bandwidth by omitting fields not needed for visualization.
+ */
+export interface PokemonSnapshotClient {
+	name: string;
+	species: string;      // For sprite lookup
+	hp: number;           // Percentage
+	status?: string;      // Only included if not empty
+	fainted: boolean;
+	isActive: boolean;
+}
+
+/**
+ * Converts a full PokemonSnapshot to the minimal client format
+ */
+export function toClientSnapshot(snap: PokemonSnapshot): PokemonSnapshotClient {
+	const client: PokemonSnapshotClient = {
+		name: snap.name,
+		species: snap.species,
+		hp: snap.hp,
+		fainted: snap.fainted,
+		isActive: snap.isActive,
+	};
+	// Only include status if present to save bytes
+	if (snap.status) {
+		client.status = snap.status;
+	}
+	return client;
 }
 
 export interface TransferResult {
@@ -816,8 +850,8 @@ export class MultiBattleManager {
 		};
 
 		console.log(`[Timeline Team] getSnapshot result - turn ${snapshot.turn}, ended: ${snapshot.ended}`);
-		console.log(`[Timeline Team]   p1 team: [${snapshot.p1.team.map(p => `${p.name}(${p.hpPercent}%)`).join(', ')}]`);
-		console.log(`[Timeline Team]   p2 team: [${snapshot.p2.team.map(p => `${p.name}(${p.hpPercent}%)`).join(', ')}]`);
+		console.log(`[Timeline Team]   p1 team: [${snapshot.p1.team.map(p => `${p.name}(${p.hp}%)`).join(', ')}]`);
+		console.log(`[Timeline Team]   p2 team: [${snapshot.p2.team.map(p => `${p.name}(${p.hp}%)`).join(', ')}]`);
 
 		return snapshot;
 	}
@@ -828,14 +862,17 @@ export class MultiBattleManager {
 	private getPokemonSnapshot(pokemon: Pokemon | null): PokemonSnapshot | null {
 		if (!pokemon) return null;
 
+		const fainted = pokemon.fainted || pokemon.hp <= 0;
+		const maxhp = pokemon.maxhp || 100;
+		const hpPercent = fainted ? 0 : (maxhp > 0 ? Math.round((pokemon.hp / maxhp) * 100) : 0);
+
 		return {
 			name: pokemon.name,
 			species: pokemon.species.name,
-			hp: pokemon.hp,
-			maxhp: pokemon.maxhp,
-			hpPercent: pokemon.maxhp > 0 ? Math.round((pokemon.hp / pokemon.maxhp) * 100) : 0,
+			hp: hpPercent,
+			maxhp: maxhp,
 			status: pokemon.status || '',
-			fainted: pokemon.fainted,
+			fainted: fainted,
 			isActive: pokemon.isActive,
 			boosts: { ...pokemon.boosts },
 			item: pokemon.item,
@@ -1038,6 +1075,204 @@ export class MultiBattleManager {
 		console.log(`[Timeline Team]   pokemonLeft: ${battleSide.pokemonLeft}`);
 
 		return { success: true, transferredPokemon: transferredState };
+	}
+
+	/**
+	 * Restores a side's team to a snapshot state WITHOUT adding a transferred Pokemon.
+	 * Used for the non-transferring side when a branch is created.
+	 * This ensures both sides reflect the target turn's state.
+	 */
+	restoreTeamFromSnapshot(
+		battleId: string,
+		side: 'p1' | 'p2',
+		snapshotSets: PokemonSet[],
+		snapshotDisplays: PokemonSnapshot[]
+	): TransferResult {
+		console.log(`[Timeline Team] restoreTeamFromSnapshot("${battleId}", "${side}")`);
+		console.log(`[Timeline Team]   Snapshot sets: ${snapshotSets.length}, displays: ${snapshotDisplays.length}`);
+
+		const battle = this.getBattle(battleId);
+		if (!battle) return { success: false, error: `Battle "${battleId}" not found` };
+		if (battle.ended) return { success: false, error: `Battle has ended` };
+
+		const battleSide = battle[side];
+		if (!battleSide) return { success: false, error: `Invalid side "${side}"` };
+
+		// Build a display lookup by name/species for HP/status/boosts
+		const displayByName = new Map<string, PokemonSnapshot>();
+		for (const d of snapshotDisplays) {
+			displayByName.set(d.name.toLowerCase(), d);
+			displayByName.set(d.species.toLowerCase(), d);
+		}
+
+		// Find which Pokemon was active in the snapshot
+		const activeDisplay = snapshotDisplays.find(d => d.isActive && !d.fainted);
+		console.log(`[Timeline Team] Active Pokemon in snapshot: ${activeDisplay?.name || 'none'}`);
+
+		// ── STEP 1: Faint all existing Pokemon ──
+		for (const pokemon of battleSide.pokemon) {
+			pokemon.fainted = true;
+			pokemon.faintQueued = false;
+			pokemon.hp = 0;
+			pokemon.isActive = false;
+			pokemon.status = 'fnt' as any;
+		}
+		battleSide.active[0] = null as any;
+
+		// ── STEP 2: Clear team arrays ──
+		battleSide.pokemon = [];
+		battleSide.team = [];
+		battleSide.pokemonLeft = 0;
+
+		// ── STEP 3: Reset slotConditions ──
+		battleSide.slotConditions = [];
+		for (let i = 0; i < battleSide.active.length; i++) {
+			battleSide.slotConditions[i] = {};
+		}
+		console.log(`[Timeline Team] Team cleared for ${side}`);
+
+		// ── STEP 4: Rebuild team from snapshot sets ──
+		let activePokemon: Pokemon | null = null;
+		let activeDisplayData: PokemonSnapshot | null = null;
+
+		for (const set of snapshotSets) {
+			const completeSet = ensureCompletePokemonSet(set);
+			const pokemon = battleSide.addPokemon(completeSet);
+			if (!pokemon) {
+				console.log(`[Timeline Team]   addPokemon returned null for ${set.name}`);
+				continue;
+			}
+
+			// Find matching display data
+			const display = displayByName.get(pokemon.name.toLowerCase())
+				|| displayByName.get(pokemon.species.name.toLowerCase());
+
+			if (display) {
+				if (display.fainted || display.hp <= 0) {
+					pokemon.fainted = true;
+					pokemon.hp = 0;
+					pokemon.status = 'fnt' as any;
+					battleSide.pokemonLeft--;
+					console.log(`[Timeline Team]   ${pokemon.name} - fainted (from snapshot)`);
+				} else {
+					// Apply HP (stored as percentage)
+					pokemon.hp = Math.max(1, Math.round((display.hp / 100) * pokemon.maxhp));
+
+					// Apply status
+					if (display.status && display.status !== '') {
+						pokemon.setStatus(display.status as any);
+					}
+
+					console.log(`[Timeline Team]   ${pokemon.name} HP: ${pokemon.hp}/${pokemon.maxhp} (${display.hp}%), status: ${display.status || 'none'}`);
+
+					// Track if this is the active Pokemon - we'll apply boosts after switch-in
+					if (display.isActive) {
+						activePokemon = pokemon;
+						activeDisplayData = display;
+					}
+				}
+			} else {
+				console.log(`[Timeline Team]   ${pokemon.name} - no display data, keeping full HP`);
+			}
+		}
+
+		// ── STEP 5: Switch in the active Pokemon ──
+		if (activePokemon && !activePokemon.fainted) {
+			try {
+				battle.actions.switchIn(activePokemon, 0);
+				console.log(`[Timeline Team] Switched in ${activePokemon.name} as active`);
+			} catch (e: any) {
+				console.log(`[Timeline Team] switchIn threw: ${e.message}, using manual fallback`);
+				battleSide.active[0] = activePokemon;
+				activePokemon.isActive = true;
+				activePokemon.activeTurns = 0;
+				activePokemon.activeMoveActions = 0;
+				activePokemon.position = 0;
+			}
+
+			// ── STEP 6: Apply boosts and volatiles to the active Pokemon ──
+			// This must happen AFTER switch-in since switching clears boosts
+			if (activeDisplayData) {
+				// Apply stat boosts
+				if (activeDisplayData.boosts) {
+					const boostKeys = ['atk', 'def', 'spa', 'spd', 'spe', 'accuracy', 'evasion'] as const;
+					for (const stat of boostKeys) {
+						const boost = activeDisplayData.boosts[stat];
+						if (boost !== undefined && boost !== 0) {
+							activePokemon.boosts[stat] = boost;
+						}
+					}
+					console.log(`[Timeline Team]   Applied boosts: ${JSON.stringify(activeDisplayData.boosts)}`);
+				}
+
+				// Apply volatiles (only safe ones that can be restored as flags)
+				if (activeDisplayData.volatiles && activeDisplayData.volatiles.length > 0) {
+					const safeVolatiles = new Set([
+						'substitute', 'confusion', 'leechseed', 'curse',
+						'embargo', 'healblock', 'partiallytrapped',
+						'taunt', 'torment', 'encore', 'disable', 'attract',
+						'focusenergy', 'magnetrise', 'aquaring', 'ingrain',
+						'flashfire', 'slowstart', 'truant', 'unburden',
+						'charge', 'defensecurl', 'lockon', 'minimize',
+						'stockpile', 'stockpile1', 'stockpile2', 'stockpile3',
+					]);
+
+					const appliedVolatiles: string[] = [];
+					for (const vol of activeDisplayData.volatiles) {
+						if (safeVolatiles.has(vol)) {
+							activePokemon.volatiles[vol] = {
+								id: vol as ID,
+								target: activePokemon,
+								effectOrder: 0,
+							};
+							appliedVolatiles.push(vol);
+						}
+					}
+					if (appliedVolatiles.length > 0) {
+						console.log(`[Timeline Team]   Applied volatiles: [${appliedVolatiles.join(', ')}]`);
+					}
+				}
+			}
+		} else {
+			// Find any non-fainted Pokemon to make active
+			const available = battleSide.pokemon.find(p => !p.fainted && p.hp > 0);
+			if (available) {
+				try {
+					battle.actions.switchIn(available, 0);
+					console.log(`[Timeline Team] Switched in ${available.name} as fallback active`);
+				} catch (e: any) {
+					battleSide.active[0] = available;
+					available.isActive = true;
+				}
+			} else {
+				console.log(`[Timeline Team] No Pokemon available to switch in for ${side}`);
+			}
+		}
+
+		// ── STEP 7: Reset choice state ──
+		battleSide.choice = {
+			cantUndo: false,
+			error: '',
+			actions: [],
+			forcedSwitchesLeft: 0,
+			forcedPassesLeft: 0,
+			switchIns: new Set(),
+			zMove: false,
+			mega: false,
+			ultra: false,
+			dynamax: false,
+			terastallize: false,
+		};
+
+		console.log(`[Timeline Team] Final restored team state for ${side}:`);
+		for (let i = 0; i < battleSide.pokemon.length; i++) {
+			const pokemon = battleSide.pokemon[i];
+			console.log(`[Timeline Team]   [${i}] ${pokemon.name} | HP: ${pokemon.hp}/${pokemon.maxhp} | Active: ${pokemon.isActive} | Fainted: ${pokemon.fainted} | Boosts: ${JSON.stringify(pokemon.boosts)}`);
+		}
+		console.log(`[Timeline Team]   active[0]: ${battleSide.active[0]?.name || 'EMPTY'}`);
+		console.log(`[Timeline Team]   pokemonLeft: ${battleSide.pokemonLeft}`);
+
+		return { success: true };
 	}
 
 	/**

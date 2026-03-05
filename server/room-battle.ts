@@ -1479,11 +1479,13 @@ export class RoomBattle extends RoomGame<RoomBattlePlayer> {
 		// Filter out nodes that are invalid transfer targets:
 		// 1. Current turn (can't transfer to where you already are)
 		// 2. Empty slots (turn 0 or no active Pokémon on either side)
-		const validNodes = nodes.filter(node =>
-			!node.isCurrent &&
-			node.turn > 0 &&
-			(node.p1Active !== null || node.p2Active !== null)
-		);
+		const validNodes = nodes.filter(node => {
+			if (node.isCurrent || node.turn <= 0) return false;
+			// Find active Pokemon from team arrays
+			const p1Active = node.p1Team?.find((p: any) => p.isActive && !p.fainted);
+			const p2Active = node.p2Team?.find((p: any) => p.isActive && !p.fainted);
+			return p1Active || p2Active;
+		});
 
 		if (validNodes.length === 0) {
 			return '<div style="margin-top:8px;padding:12px;border:1px solid #ddd;' +
@@ -1492,8 +1494,11 @@ export class RoomBattle extends RoomGame<RoomBattlePlayer> {
 		}
 
 		const buttons = validNodes.map(node => {
-			const p1Name = node.p1Active?.name || 'Empty';
-			const p2Name = node.p2Active?.name || 'Empty';
+			// Find active Pokemon from team arrays
+			const p1Active = node.p1Team?.find((p: any) => p.isActive && !p.fainted);
+			const p2Active = node.p2Team?.find((p: any) => p.isActive && !p.fainted);
+			const p1Name = p1Active?.name || 'Empty';
+			const p2Name = p2Active?.name || 'Empty';
 			const label = `Timeline #${node.timelineNum}, Turn ${node.turn} (${p1Name} vs ${p2Name})`;
 			const value = `${node.timelineId}|${node.turn}`;
 

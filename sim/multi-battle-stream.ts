@@ -790,6 +790,9 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
         case 'start': {
             const options = JSON.parse(message);
             this.matchId = options.roomid || `match-${Date.now()}`;
+            if (!this.matchId) {
+                throw new Error('Invalid match ID')
+            }
             console.log(`[TIMELINE DEBUG] Starting match: ${this.matchId}`);
 
             const rootBattleId = this.getRootBattleId();

@@ -385,6 +385,32 @@ export class MultiBattleManager {
 	}
 
 	/**
+	 * Removes the active Pokémon from a side after its state has already been
+	 * captured for transfer. Decrements pokemonLeft and clears the active slot.
+	 * Does NOT call extractPokemon (which also zeros HP / marks fnt).
+	 */
+	removePokemonAfterCapture(battleId: string, side: 'p1' | 'p2', position: number = 0): boolean {
+		const battle = this.getBattle(battleId);
+		if (!battle) return false;
+		const battleSide = battle[side];
+		if (!battleSide) return false;
+
+		const pokemon = battleSide.active[position];
+		if (!pokemon || pokemon.fainted) return false;
+
+		pokemon.fainted = true;
+		pokemon.faintQueued = false;
+		pokemon.hp = 0;
+		pokemon.isActive = false;
+		pokemon.status = 'fnt' as any;
+		battleSide.active[position] = null as any;
+		battleSide.pokemonLeft = Math.max(0, battleSide.pokemonLeft - 1);
+
+		console.log(`[Timeline Team] removePokemonAfterCapture: ${pokemon.name} removed from ${side}, pokemonLeft=${battleSide.pokemonLeft}`);
+		return true;
+	}
+
+	/**
 	 * Handles output from a battle
 	 */
 	private handleBattleOutput(battleId: string, type: string, data: string | string[]): void {

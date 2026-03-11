@@ -9,4 +9,6 @@ equal turn number)
 
 Use th ecode labeled as the test in transfer queue in room battle as the basis for switching, 
 
-also do the ui fixes. 
+also do the ui fixes. the empty vs. empty in the buttons
+
+?? transfer only available if there is space aka at least on fainted pokemon can be replaced. 

@@ -368,11 +368,7 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
         for (const [groupKey, groupTransfers] of groups) {
             console.log(`[TIMELINE DEBUG] Group "${groupKey}": ${groupTransfers.map(t => t.sideId).join(', ')}`);
             try {
-                if (groupTransfers.length === 1) {
-                    this.executeTransfer(groupTransfers[0]);
-                } else {
-                    this.executeJointTransfer(groupTransfers);
-                }
+                this.executeTransferGroup(groupTransfers);
                 anyTransferExecuted = true;
             } catch (err: any) {
                 console.log(`[TIMELINE DEBUG] Group execution failed: ${err.message}`);
@@ -395,18 +391,20 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
     }
 
     /**
-     * Handle two players both transferring to the same (targetGlobalId, targetTurn).
-     * Creates exactly one branch. Each side is rebuilt via replaceTeamFromSnapshot
-     * using its own transferred Pokemon + the target snapshot for that side.
+     * Executes one group of transfers that all share the same target
+     * (targetGlobalId + targetTurn). Handles 1 or 2 transferring sides.
+     * Both sides of the source battle are rebuilt: transferring sides via
+     * replaceTeamFromSnapshot, non-transferring sides via restoreTeamFromSnapshot.
      */
-    private executeJointTransfer(transfers: PendingTransfer[]) {
+    private executeTransferGroup(transfers: PendingTransfer[]) {
+        if (transfers.length === 0) return;
+
         const { targetGlobalId, targetTurn, sourceBattleId } = transfers[0];
 
-        // Guard: all transfers in the group must share the same source battle
         for (const t of transfers) {
             if (t.sourceBattleId !== sourceBattleId) {
                 throw new Error(
-                    `Joint transfer: mismatched source battles ("${t.sourceBattleId}" vs "${sourceBattleId}")`
+                    `Transfer group: mismatched source battles ("${t.sourceBattleId}" vs "${sourceBattleId}")`
                 );
             }
         }
@@ -416,11 +414,10 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
             throw new Error(`Target battle "${targetGlobalId}" not found in manager`);
         }
 
-        console.log(`[TIMELINE DEBUG] executeJointTransfer: [${transfers.map(t => t.sideId).join(', ')}] -> ${targetGlobalId} turn ${targetTurn}`);
+        const transferringSides = new Set(transfers.map(t => t.sideId as 'p1' | 'p2'));
+        const allSides: ('p1' | 'p2')[] = ['p1', 'p2'];
 
-        // ── Step 1: Capture all transfer states before modifying the battle ──
-        // This must happen first so neither capture is affected by the other
-        // side's team being replaced.
+        // ── Step 1: Capture all transfer states before modifying anything ──
         const capturedStates = new Map<'p1' | 'p2', PokemonTransferState>();
         for (const transfer of transfers) {
             const side = transfer.sideId as 'p1' | 'p2';
@@ -429,108 +426,65 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
                 throw new Error(`No active Pokemon to transfer for ${side}`);
             }
             capturedStates.set(side, state);
-            console.log(`[TIMELINE DEBUG]   Captured ${side}: ${state.set.name || state.set.species}`);
+            console.log(`[TIMELINE DEBUG] Captured ${side}: ${state.set.name || state.set.species}`);
         }
 
-        // ── Step 2: Rebuild each transferring side ──
-        // Because both sides are transferring, there is no "other side" to
-        // restore — both are handled by replaceTeamFromSnapshot.
-        for (const transfer of transfers) {
-            const side = transfer.sideId as 'p1' | 'p2';
-            const transferredState = capturedStates.get(side)!;
+        // ── Step 2: Remove source Pokemon now that states are captured ──
+        for (const side of transferringSides) {
+            this.manager.removePokemonAfterCapture(sourceBattleId, side, 0);
+            console.log(`[TIMELINE DEBUG] Removed ${side} from source battle`);
+        }
 
+        // ── Step 3: Rebuild each side ──
+        for (const side of allSides) {
             const snapshotSets = this.getStoredSets(targetGlobalId, targetTurn, side);
             const snapshotDisplays = this.getStoredSnapshots(targetGlobalId, targetTurn, side);
 
-            console.log(`[TIMELINE DEBUG]   Replacing team for ${side} ` +
-                `(${snapshotSets?.length ?? 0} bench sets from target)`);
-
-            const result = this.manager.replaceTeamFromSnapshot(
-                sourceBattleId,
-                side,
-                snapshotSets || [],
-                snapshotDisplays || [],
-                transferredState
-            );
-
-            if (!result.success) {
-                throw new Error(`replaceTeamFromSnapshot failed for ${side}: ${result.error}`);
+            if (transferringSides.has(side)) {
+                // Transferring side: swap in the captured Pokemon
+                const transferredState = capturedStates.get(side)!;
+                console.log(`[TIMELINE DEBUG] Replacing team for ${side} (transferring)`);
+                const result = this.manager.replaceTeamFromSnapshot(
+                    sourceBattleId,
+                    side,
+                    snapshotSets || [],
+                    snapshotDisplays || [],
+                    transferredState
+                );
+                if (!result.success) {
+                    throw new Error(`replaceTeamFromSnapshot failed for ${side}: ${result.error}`);
+                }
+            } else {
+                // Non-transferring side: restore from target snapshot
+                if (snapshotSets && snapshotSets.length > 0) {
+                    console.log(`[TIMELINE DEBUG] Restoring team for ${side} (non-transferring)`);
+                    const result = this.manager.restoreTeamFromSnapshot(
+                        sourceBattleId,
+                        side,
+                        snapshotSets,
+                        snapshotDisplays || []
+                    );
+                    if (!result.success) {
+                        console.log(`[TIMELINE DEBUG] Warning: restoreTeamFromSnapshot failed for ${side}: ${result.error}`);
+                    }
+                }
             }
         }
 
-        // ── Step 3: Register one branch for the whole joint transfer ──
+        // ── Step 4: Register one branch for this group ──
         const branchGlobalId = this.registerBranch(sourceBattleId, targetGlobalId, targetTurn);
         const branchNum = this.timelineRegistry.get(branchGlobalId)!.num;
 
-        const sideList = transfers.map(t => t.sideId).join(' and ');
+        // ── Step 5: Snapshot the branch state immediately ──
+        const srcBattle = this.manager.getBattle(sourceBattleId);
+        if (srcBattle) this.captureSnapshot(branchGlobalId, srcBattle);
+
+        // ── Step 6: Push one message describing the transfer ──
+        const sideList = [...transferringSides].join(' and ');
         const coord = `Timeline ${targetGlobalId}, Turn ${targetTurn}`;
         this.pushMessage('update',
-            `|-message|${sideList} both transferred to ${coord}! Branch #${branchNum} created at turn ${targetTurn + 1}.`);
-    }
-
-    /**
-     * Handle a single player transferring to a target point.
-     * Creates one branch and restores the non-transferring side from the
-     * target snapshot.
-     */
-    private executeTransfer(transfer: PendingTransfer) {
-        const { sideId, sourceBattleId, targetGlobalId, targetTurn } = transfer;
-
-        const resolvedTargetId = this.resolveManagerBattleId(targetGlobalId);
-        if (!resolvedTargetId) {
-            throw new Error(`Target battle "${targetGlobalId}" not found in manager`);
-        }
-
-        const transferState = this.manager.getPokemonTransferState(
-            sourceBattleId,
-            sideId as 'p1' | 'p2',
-            0
+            `|-message|${sideList}'s Pokémon transferred to ${coord}! Branch #${branchNum} created at turn ${targetTurn + 1}.`
         );
-        if (!transferState) {
-            throw new Error(`No active Pokemon to transfer`);
-        }
-        console.log(`[TIMELINE DEBUG] Captured transfer state for ${transferState.set.name || transferState.set.species}`);
-
-        const targetSide = sideId as 'p1' | 'p2';
-        const snapshotSets = this.getStoredSets(targetGlobalId, targetTurn, targetSide);
-        const snapshotDisplays = this.getStoredSnapshots(targetGlobalId, targetTurn, targetSide);
-
-        const result = this.manager.replaceTeamFromSnapshot(
-            sourceBattleId,
-            sideId as 'p1' | 'p2',
-            snapshotSets || [],
-            snapshotDisplays || [],
-            transferState
-        );
-
-        if (!result.success) {
-            throw new Error(result.error || 'Transfer failed');
-        }
-
-        // Restore the non-transferring side from the target snapshot
-        const otherSide = (sideId === 'p1' ? 'p2' : 'p1') as 'p1' | 'p2';
-        const otherSnapshotSets = this.getStoredSets(targetGlobalId, targetTurn, otherSide);
-        const otherSnapshotDisplays = this.getStoredSnapshots(targetGlobalId, targetTurn, otherSide);
-
-        if (otherSnapshotSets && otherSnapshotSets.length > 0) {
-            console.log(`[TIMELINE DEBUG] Restoring non-transferring side (${otherSide})`);
-            const restoreResult = this.manager.restoreTeamFromSnapshot(
-                sourceBattleId,
-                otherSide,
-                otherSnapshotSets,
-                otherSnapshotDisplays || []
-            );
-            if (!restoreResult.success) {
-                console.log(`[TIMELINE DEBUG] Warning: Failed to restore ${otherSide}: ${restoreResult.error}`);
-            }
-        }
-
-        const branchGlobalId = this.registerBranch(sourceBattleId, targetGlobalId, targetTurn);
-        const branchNum = this.timelineRegistry.get(branchGlobalId)!.num;
-
-        const coord = `Timeline ${targetGlobalId}, Turn ${targetTurn}`;
-        this.pushMessage('update',
-            `|-message|${sideId}'s Pokémon transferred to ${coord}! Branch #${branchNum} created at turn ${targetTurn + 1}.`);
     }
 
     /**

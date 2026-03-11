@@ -177,7 +177,6 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
     }> = new Map();
     private timelineCounter = 0;
     private turnJustResolved = false;
-    private frozenTimelineIds: Set<string> = new Set();
     private pendingTransfers: Map<string, PendingTransfer> = new Map();
     private turnResolving = false;
     private turnBeforeWrite: number | undefined;
@@ -390,6 +389,8 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
             return;
         }
 
+        this.switchToPresentIfNeeded();
+
         this.finalizeAfterTransfers(battle);
     }
 
@@ -535,8 +536,8 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
     /**
      * Create and register a branch timeline entry.
      * Shared between executeTransfer and executeJointTransfer.
-     * Handles: freezing the source timeline, registry entry creation,
-     * send hook installation, active timeline pointer update, and turn reset.
+     * Handles:  registry entry creation, send hook installation,
+     * active timeline pointer update, and turn reset.
      *
      * Returns the new branch's globalId.
      */
@@ -545,12 +546,6 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
         targetGlobalId: string,
         targetTurn: number
     ): string {
-        // Freeze the current timeline — it now shares its battle with the branch
-        if (this.battle?.currentTimelineId) {
-            this.frozenTimelineIds.add(this.battle.currentTimelineId);
-            console.log(`[TIMELINE DEBUG] Froze timeline: ${this.battle.currentTimelineId}`);
-        }
-
         const targetEntry = this.timelineRegistry.get(targetGlobalId);
         if (!targetEntry) {
             throw new Error(`Target timeline "${targetGlobalId}" not in registry`);
@@ -711,35 +706,89 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
         this.pushMessage('update', `|timenodes|${JSON.stringify(data)}`);
     }
 
-    private computeAndSwitchToPresent(): string {
+    /** Each timeline's head turn — NOT battle.turn (which is shared). */
+    private getTimelineHeadTurn(globalId: string): number {
+        // The current timeline owns battle.turn
+        if (globalId === this.battle?.currentTimelineId) {
+            const entry = this.timelineRegistry.get(globalId);
+            const b = entry ? this.manager.getBattle(entry.battleId) : null;
+            if (b) return b.turn;
+        }
+        // Non-current timelines: use their snapshot history's max turn
+        const history = this.turnSnapshots.get(globalId);
+        if (history && history.size > 0) {
+            let max = 0;
+            for (const t of history.keys()) if (t > max) max = t;
+            return max;
+        }
+        // Newly-minted branch with no snapshot yet
+        const entry = this.timelineRegistry.get(globalId);
+        return entry?.fromTurn != null ? entry.fromTurn + 1 : 0;
+    }
+
+    /** Pure computation — no side effects. Safe for _getTimelineNodes. */
+    private computePresentId(): string {
         let presentId = '';
         let lowestTurn = Infinity;
         let lowestNum = Infinity;
 
         for (const [globalId, entry] of this.timelineRegistry) {
-            if (this.frozenTimelineIds.has(globalId)) continue;
-            const battle = this.manager.getBattle(entry.battleId);
-            if (!battle || battle.ended) continue;
-            const turn = battle.turn;
+            const b = this.manager.getBattle(entry.battleId);
+            if (!b || b.ended) continue;
+
+            const turn = this.getTimelineHeadTurn(globalId);   // ← FIX 1
             if (turn < lowestTurn || (turn === lowestTurn && entry.num < lowestNum)) {
                 lowestTurn = turn;
                 lowestNum = entry.num;
                 presentId = globalId;
             }
         }
+        return presentId || this.battle?.currentTimelineId || '';
+    }
 
-        if (presentId && this.battle && this.battle.currentTimelineId !== presentId) {
-            const entry = this.timelineRegistry.get(presentId);
-            const battle = entry ? this.manager.getBattle(entry.battleId) : null;
-            if (entry && battle) {
-                console.log(`[TIMELINE DEBUG] Switching present: ${this.battle.currentTimelineId} -> ${presentId}`);
-                this.battle.currentTimelineId = presentId;
-                this.battle.currentTimeline = { ...entry, battle };
-                this.hookBattleSend(presentId, battle);
+    /**
+     * Switch the active Battle to the present timeline, restoring both
+     * teams from that timeline's snapshot. Returns true if a switch happened.
+     * This is the "transfer without adding/removing" you described.
+     */
+    private switchToPresentIfNeeded(): boolean {
+        const presentId = this.computePresentId();
+        if (!presentId || !this.battle) return false;
+        if (this.battle.currentTimelineId === presentId) return false;
+
+        const entry = this.timelineRegistry.get(presentId)!;
+        const battle = this.manager.getBattle(entry.battleId);
+        if (!battle) return false;
+
+        const presentTurn = this.getTimelineHeadTurn(presentId);
+        console.log(`[TIMELINE DEBUG] Present shift: ${this.battle.currentTimelineId} → ${presentId} @ turn ${presentTurn}`);
+
+        // Snapshot the outgoing timeline so it can be revisited later
+        const outgoingId = this.battle.currentTimelineId;
+        const outEntry = this.timelineRegistry.get(outgoingId);
+        const outBattle = outEntry ? this.manager.getBattle(outEntry.battleId) : null;
+        if (outBattle) this.captureSnapshot(outgoingId, outBattle);
+
+        // ── FIX 2: restore both sides from the present node's snapshot ──
+        for (const side of ['p1', 'p2'] as const) {
+            const sets = this.getStoredSets(presentId, presentTurn, side);
+            const displays = this.getStoredSnapshots(presentId, presentTurn, side);
+            if (sets?.length && displays?.length) {
+                this.manager.restoreTeamFromSnapshot(entry.battleId, side, sets, displays);
             }
         }
+        battle.turn = presentTurn;   // realign the shared Battle's turn counter
 
-        return presentId || this.battle?.currentTimelineId || '';
+        this.battle.currentTimelineId = presentId;
+        this.battle.currentTimeline = { ...entry, battle };
+        this.hookBattleSend(presentId, battle);
+        return true;
+    }
+
+    // Keep the old name as a thin wrapper for existing callers:
+    private computeAndSwitchToPresent(): string {
+        this.switchToPresentIfNeeded();
+        return this.battle?.currentTimelineId || '';
     }
 
     override _write(chunk: string) {
@@ -761,6 +810,10 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
         if (this.turnJustResolved) {
             this.turnJustResolved = false;
             this.executePendingTransfers();
+        } else if (this.switchToPresentIfNeeded()) {
+            // A normal turn advanced one timeline past another — realign
+            const b = this.battle?.battle;
+            if (b && !b.ended) this.finalizeAfterTransfers(b);
         }
     }
 
@@ -981,7 +1034,7 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
             }
         }
 
-        const computedCurrentId = this.computeAndSwitchToPresent();
+        const computedCurrentId = this.computePresentId();
         const allNodes: TimelineNodeData[] = [];
 
         for (const [globalId, entry] of this.timelineRegistry) {

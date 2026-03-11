@@ -337,7 +337,6 @@ export class MultiBattleManager {
 	 */
 	getBattle(battleId: string): Battle | undefined {
 		const battle = this.battles.get(battleId);
-		console.log(`[Timeline Team] getBattle("${battleId}") -> ${battle ? 'found' : 'not found'}`);
 		return battle;
 	}
 
@@ -414,7 +413,6 @@ export class MultiBattleManager {
 			throw new Error(`Battle "${battleId}" not found`);
 		}
 		const result = battle.choose(side, choice);
-		console.log(`[Timeline Team] choose result: ${result}`);
 		return result;
 	}
 

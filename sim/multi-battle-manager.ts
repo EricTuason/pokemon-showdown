@@ -101,6 +101,7 @@ export interface BattleSnapshot {
 	winner: string | undefined;
 	p1: SideSnapshot;
 	p2: SideSnapshot;
+	field: FieldSnapshot;
 }
 
 export interface SideSnapshot {
@@ -108,6 +109,8 @@ export interface SideSnapshot {
 	pokemonLeft: number;
 	active: PokemonSnapshot[];
 	team: PokemonSnapshot[];
+	sideConditions: SideConditionSnapshot[];
+	slotConditions: { [slot: number]: SlotConditionSnapshot[] };
 }
 
 /**
@@ -128,6 +131,43 @@ export interface PokemonSnapshot {
 	moves: string[];
 	position: number;
 	volatiles: string[];
+}
+
+/**
+ * Snapshot of a field condition (weather, terrain, or pseudo-weather)
+ */
+export interface FieldConditionSnapshot {
+	id: string;
+	turnsLeft?: number;
+	source?: string;  // Pokemon that set it, if any
+}
+
+/**
+ * Snapshot of the battle field state
+ */
+export interface FieldSnapshot {
+	weather: FieldConditionSnapshot | null;
+	terrain: FieldConditionSnapshot | null;
+	pseudoWeather: FieldConditionSnapshot[];
+}
+
+/**
+ * Snapshot of a side condition (e.g., Stealth Rock, Reflect, Spikes)
+ */
+export interface SideConditionSnapshot {
+	id: string;
+	turnsLeft?: number;
+	layers?: number;  // For stackable conditions like Spikes
+	source?: string;
+}
+
+/**
+ * Snapshot of a slot condition (e.g., Wish, Healing Wish)
+ */
+export interface SlotConditionSnapshot {
+	id: string;
+	turnsLeft?: number;
+	source?: string;
 }
 
 /**
@@ -855,6 +895,122 @@ export class MultiBattleManager {
 	}
 
 	/**
+	 * Gets a snapshot of the battle field conditions
+	 */
+	private getFieldSnapshot(battle: Battle): FieldSnapshot {
+		const field = battle.field;
+		console.log(`[Timeline Field] Capturing field snapshot - weather: ${field.weather || 'none'}, terrain: ${field.terrain || 'none'}`);
+		
+		let weatherSnapshot: FieldConditionSnapshot | null = null;
+		if (field.weather) {
+			const turnsLeft = field.weatherState.duration;
+			const source = field.weatherState.source?.name;
+			weatherSnapshot = {
+				id: field.weather,
+				turnsLeft: turnsLeft !== undefined ? turnsLeft : undefined,
+				source: source,
+			};
+			console.log(`[Timeline Field]   Weather: ${field.weather}, turnsLeft: ${turnsLeft ?? 'infinite'}, source: ${source || 'unknown'}`);
+		}
+
+		let terrainSnapshot: FieldConditionSnapshot | null = null;
+		if (field.terrain) {
+			const turnsLeft = field.terrainState.duration;
+			const source = field.terrainState.source?.name;
+			terrainSnapshot = {
+				id: field.terrain,
+				turnsLeft: turnsLeft !== undefined ? turnsLeft : undefined,
+				source: source,
+			};
+			console.log(`[Timeline Field]   Terrain: ${field.terrain}, turnsLeft: ${turnsLeft ?? 'infinite'}, source: ${source || 'unknown'}`);
+		}
+
+		const pseudoWeatherSnapshots: FieldConditionSnapshot[] = [];
+		for (const id in field.pseudoWeather) {
+			const state = field.pseudoWeather[id];
+			const snapshot: FieldConditionSnapshot = {
+				id: id,
+				turnsLeft: state.duration !== undefined ? state.duration : undefined,
+				source: state.source?.name,
+			};
+			pseudoWeatherSnapshots.push(snapshot);
+			console.log(`[Timeline Field]   PseudoWeather: ${id}, turnsLeft: ${state.duration ?? 'infinite'}, source: ${state.source?.name || 'unknown'}`);
+		}
+
+		if (pseudoWeatherSnapshots.length === 0 && !weatherSnapshot && !terrainSnapshot) {
+			console.log(`[Timeline Field]   No field conditions active`);
+		}
+
+		return {
+			weather: weatherSnapshot,
+			terrain: terrainSnapshot,
+			pseudoWeather: pseudoWeatherSnapshots,
+		};
+	}
+
+	/**
+	 * Gets a snapshot of side conditions for a given side
+	 */
+	private getSideConditionsSnapshot(side: Side): SideConditionSnapshot[] {
+		const conditions: SideConditionSnapshot[] = [];
+		
+		console.log(`[Timeline Side] Capturing side conditions for ${side.id}`);
+		
+		for (const id in side.sideConditions) {
+			const state = side.sideConditions[id];
+			const snapshot: SideConditionSnapshot = {
+				id: id,
+				turnsLeft: state.duration !== undefined ? state.duration : undefined,
+				layers: state.layers !== undefined ? state.layers : undefined,
+				source: state.source?.name,
+			};
+			conditions.push(snapshot);
+			console.log(`[Timeline Side]   ${side.id} condition: ${id}, turnsLeft: ${state.duration ?? 'N/A'}, layers: ${state.layers ?? 'N/A'}, source: ${state.source?.name || 'unknown'}`);
+		}
+
+		if (conditions.length === 0) {
+			console.log(`[Timeline Side]   ${side.id} has no side conditions`);
+		}
+
+		return conditions;
+	}
+
+	/**
+	 * Gets a snapshot of slot conditions for a given side
+	 */
+	private getSlotConditionsSnapshot(side: Side): { [slot: number]: SlotConditionSnapshot[] } {
+		const slotConditions: { [slot: number]: SlotConditionSnapshot[] } = {};
+		
+		console.log(`[Timeline Side] Capturing slot conditions for ${side.id}`);
+		
+		if (side.slotConditions) {
+			for (let slot = 0; slot < side.slotConditions.length; slot++) {
+				const slotConds = side.slotConditions[slot];
+				if (!slotConds || Object.keys(slotConds).length === 0) continue;
+
+				slotConditions[slot] = [];
+				for (const id in slotConds) {
+					const state = slotConds[id];
+					const snapshot: SlotConditionSnapshot = {
+						id: id,
+						turnsLeft: state.duration !== undefined ? state.duration : undefined,
+						source: state.source?.name,
+					};
+					slotConditions[slot].push(snapshot);
+					console.log(`[Timeline Side]   ${side.id} slot ${slot} condition: ${id}, turnsLeft: ${state.duration ?? 'N/A'}, source: ${state.source?.name || 'unknown'}`);
+				}
+			}
+		}
+
+		const totalSlotConditions = Object.values(slotConditions).reduce((sum, arr) => sum + arr.length, 0);
+		if (totalSlotConditions === 0) {
+			console.log(`[Timeline Side]   ${side.id} has no slot conditions`);
+		}
+
+		return slotConditions;
+	}
+
+	/**
 	 * Gets a snapshot of a battle's current state
 	 */
 	getSnapshot(battleId: string): BattleSnapshot | null {
@@ -871,7 +1027,10 @@ export class MultiBattleManager {
 				.map(p => this.getPokemonSnapshot(p))
 				.filter((p): p is PokemonSnapshot => p !== null);
 			
-			console.log(`[Timeline Team] getSnapshot side ${side.id}: ${teamSnapshot.length} Pokemon, ${side.pokemonLeft} left`);
+			const sideConditions = this.getSideConditionsSnapshot(side);
+			const slotConditions = this.getSlotConditionsSnapshot(side);
+			
+			console.log(`[Timeline Team] getSnapshot side ${side.id}: ${teamSnapshot.length} Pokemon, ${side.pokemonLeft} left, ${sideConditions.length} side conditions`);
 			
 			return {
 				name: side.name,
@@ -881,8 +1040,12 @@ export class MultiBattleManager {
 					.map(p => this.getPokemonSnapshot(p))
 					.filter((p): p is PokemonSnapshot => p !== null),
 				team: teamSnapshot,
+				sideConditions: sideConditions,
+				slotConditions: slotConditions,
 			};
 		};
+
+		const fieldSnapshot = this.getFieldSnapshot(battle);
 
 		const snapshot = {
 			battleId,
@@ -891,11 +1054,15 @@ export class MultiBattleManager {
 			winner: battle.winner,
 			p1: getSideSnapshot(battle.p1),
 			p2: getSideSnapshot(battle.p2),
+			field: fieldSnapshot,
 		};
 
 		console.log(`[Timeline Team] getSnapshot result - turn ${snapshot.turn}, ended: ${snapshot.ended}`);
 		console.log(`[Timeline Team]   p1 team: [${snapshot.p1.team.map(p => `${p.name}(${p.hp}%)`).join(', ')}]`);
 		console.log(`[Timeline Team]   p2 team: [${snapshot.p2.team.map(p => `${p.name}(${p.hp}%)`).join(', ')}]`);
+		console.log(`[Timeline Team]   field: weather=${snapshot.field.weather?.id || 'none'}, terrain=${snapshot.field.terrain?.id || 'none'}, pseudoWeather=[${snapshot.field.pseudoWeather.map(pw => pw.id).join(', ')}]`);
+		console.log(`[Timeline Team]   p1 conditions: [${snapshot.p1.sideConditions.map(c => c.id).join(', ')}]`);
+		console.log(`[Timeline Team]   p2 conditions: [${snapshot.p2.sideConditions.map(c => c.id).join(', ')}]`);
 
 		return snapshot;
 	}

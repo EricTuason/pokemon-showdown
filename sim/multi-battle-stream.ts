@@ -22,6 +22,34 @@ export interface TimelineNodeData {
 	ended: boolean;
 	p1Team: PokemonSnapshotClient[];
 	p2Team: PokemonSnapshotClient[];
+	p1SideConditions: SideConditionSnapshot[];
+	p2SideConditions: SideConditionSnapshot[];
+	field: FieldSnapshot;
+}
+
+export interface FieldConditionSnapshot {
+	id: string;
+	turnsLeft?: number;
+	source?: string;
+}
+
+export interface FieldSnapshot {
+	weather: FieldConditionSnapshot | null;
+	terrain: FieldConditionSnapshot | null;
+	pseudoWeather: FieldConditionSnapshot[];
+}
+
+export interface SideConditionSnapshot {
+	id: string;
+	turnsLeft?: number;
+	layers?: number;
+	source?: string;
+}
+
+export interface SlotConditionSnapshot {
+	id: string;
+	turnsLeft?: number;
+	source?: string;
 }
 
 function pokemonToSpriteId(pokemon: any): string {
@@ -129,6 +157,100 @@ function extractTeamSets(side: any): PokemonSet[] {
 }
 
 /**
+ * Extracts field condition snapshot from a battle
+ */
+function extractFieldSnapshot(battle: any): FieldSnapshot {
+	const field = battle?.field;
+	if (!field) {
+		console.log(`[Timeline Field] extractFieldSnapshot: no field object`);
+		return { weather: null, terrain: null, pseudoWeather: [] };
+	}
+
+	console.log(`[Timeline Field] extractFieldSnapshot - weather: ${field.weather || 'none'}, terrain: ${field.terrain || 'none'}`);
+
+	let weather: FieldConditionSnapshot | null = null;
+	if (field.weather) {
+		weather = {
+			id: field.weather,
+			turnsLeft: field.weatherState?.duration,
+			source: field.weatherState?.source?.name,
+		};
+		console.log(`[Timeline Field]   Weather captured: ${weather.id}, turnsLeft: ${weather.turnsLeft ?? 'infinite'}`);
+	}
+
+	let terrain: FieldConditionSnapshot | null = null;
+	if (field.terrain) {
+		terrain = {
+			id: field.terrain,
+			turnsLeft: field.terrainState?.duration,
+			source: field.terrainState?.source?.name,
+		};
+		console.log(`[Timeline Field]   Terrain captured: ${terrain.id}, turnsLeft: ${terrain.turnsLeft ?? 'infinite'}`);
+	}
+
+	const pseudoWeather: FieldConditionSnapshot[] = [];
+	if (field.pseudoWeather) {
+		for (const id in field.pseudoWeather) {
+			const state = field.pseudoWeather[id];
+			pseudoWeather.push({
+				id: id,
+				turnsLeft: state.duration,
+				source: state.source?.name,
+			});
+			console.log(`[Timeline Field]   PseudoWeather captured: ${id}, turnsLeft: ${state.duration ?? 'infinite'}`);
+		}
+	}
+
+	return { weather, terrain, pseudoWeather };
+}
+
+/**
+ * Extracts side conditions from a battle side
+ */
+function extractSideConditions(side: any): SideConditionSnapshot[] {
+	if (!side?.sideConditions) {
+		console.log(`[Timeline Side] extractSideConditions: no sideConditions object for ${side?.id || 'unknown'}`);
+		return [];
+	}
+
+	const conditions: SideConditionSnapshot[] = [];
+	for (const id in side.sideConditions) {
+		const state = side.sideConditions[id];
+		conditions.push({
+			id: id,
+			turnsLeft: state.duration,
+			layers: state.layers,
+			source: state.source?.name,
+		});
+		console.log(`[Timeline Side]   ${side.id} condition: ${id}, turnsLeft: ${state.duration ?? 'N/A'}, layers: ${state.layers ?? 'N/A'}`);
+	}
+
+	if (conditions.length === 0) {
+		console.log(`[Timeline Side]   ${side.id} has no side conditions`);
+	}
+
+	return conditions;
+}
+
+/**
+ * Deep-clones a FieldSnapshot
+ */
+function deepCloneFieldSnapshot(field: FieldSnapshot): FieldSnapshot {
+	return {
+		weather: field.weather ? { ...field.weather } : null,
+		terrain: field.terrain ? { ...field.terrain } : null,
+		pseudoWeather: field.pseudoWeather.map(pw => ({ ...pw })),
+	};
+}
+
+/**
+ * Deep-clones an array of SideConditionSnapshots
+ */
+function deepCloneSideConditions(conditions: SideConditionSnapshot[]): SideConditionSnapshot[] {
+	return conditions.map(c => ({ ...c }));
+}
+
+/**
  * Deep-clones a PokemonSnapshot, including nested objects.
  */
 function deepCloneSnapshot(p: PokemonSnapshot): PokemonSnapshot {
@@ -160,19 +282,29 @@ function deepCloneTurnSnapshot(snap: {
 	p2Team: PokemonSnapshot[];
 	p1Sets: PokemonSet[];
 	p2Sets: PokemonSet[];
+	p1SideConditions: SideConditionSnapshot[];
+	p2SideConditions: SideConditionSnapshot[];
+	field: FieldSnapshot;
 }): {
 	p1Team: PokemonSnapshot[];
 	p2Team: PokemonSnapshot[];
 	p1Sets: PokemonSet[];
 	p2Sets: PokemonSet[];
+	p1SideConditions: SideConditionSnapshot[];
+	p2SideConditions: SideConditionSnapshot[];
+	field: FieldSnapshot;
 } {
 	return {
 		p1Team: snap.p1Team.map(deepCloneSnapshot),
 		p2Team: snap.p2Team.map(deepCloneSnapshot),
 		p1Sets: snap.p1Sets.map(deepCloneSet),
 		p2Sets: snap.p2Sets.map(deepCloneSet),
+		p1SideConditions: deepCloneSideConditions(snap.p1SideConditions),
+		p2SideConditions: deepCloneSideConditions(snap.p2SideConditions),
+		field: deepCloneFieldSnapshot(snap.field),
 	};
 }
+
 
 class MultiTimeBattle {
 	manager: MultiBattleManager;
@@ -252,6 +384,9 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 		p2Team: PokemonSnapshot[];
 		p1Sets: PokemonSet[];
 		p2Sets: PokemonSet[];
+		p1SideConditions: SideConditionSnapshot[];
+		p2SideConditions: SideConditionSnapshot[];
+		field: FieldSnapshot;
 	}>> = new Map();
 
 	private captureSnapshot(timelineId: string, battle: any) {
@@ -270,9 +405,26 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 		const p2Team = extractTeamSnapshot(p2Side);
 		const p1Sets = extractTeamSets(p1Side);
 		const p2Sets = extractTeamSets(p2Side);
+		const p1SideConditions = extractSideConditions(p1Side);
+		const p2SideConditions = extractSideConditions(p2Side);
+		const field = extractFieldSnapshot(battle);
+
+		console.log(`[Timeline Snapshot] Capturing turn ${turn} for ${timelineId}`);
+		console.log(`[Timeline Snapshot]   p1 team: ${p1Team.length}, p2 team: ${p2Team.length}`);
+		console.log(`[Timeline Snapshot]   p1 conditions: [${p1SideConditions.map(c => c.id).join(', ')}]`);
+		console.log(`[Timeline Snapshot]   p2 conditions: [${p2SideConditions.map(c => c.id).join(', ')}]`);
+		console.log(`[Timeline Snapshot]   field: weather=${field.weather?.id || 'none'}, terrain=${field.terrain?.id || 'none'}, pseudoWeather=[${field.pseudoWeather.map(pw => pw.id).join(', ')}]`);
 
 		if (p1Team.length > 0 || p2Team.length > 0) {
-			history.set(turn, { p1Team, p2Team, p1Sets, p2Sets });
+			history.set(turn, { 
+				p1Team, 
+				p2Team, 
+				p1Sets, 
+				p2Sets,
+				p1SideConditions,
+				p2SideConditions,
+				field,
+			});
 		}
 	}
 
@@ -1061,7 +1213,10 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 			const history = this.turnSnapshots.get(globalId);
 			const ended = battle?.ended ?? false;
 
+			const emptyField: FieldSnapshot = { weather: null, terrain: null, pseudoWeather: [] };
+
 			if (!history || history.size === 0) {
+				console.log(`[Timeline Nodes] ${globalId}: no history, creating empty node`);
 				allNodes.push({
 					timelineId: globalId,
 					timelineNum: entry.num,
@@ -1072,6 +1227,9 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 					ended,
 					p1Team: [],
 					p2Team: [],
+					p1SideConditions: [],
+					p2SideConditions: [],
+					field: emptyField,
 				});
 				continue;
 			}
@@ -1081,6 +1239,7 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 			for (const [t] of history) { if (t > maxTurn) maxTurn = t; }
 
 			for (const [turn, snap] of history) {
+				console.log(`[Timeline Nodes] ${globalId} turn ${turn}: p1 conditions=[${snap.p1SideConditions.map(c => c.id).join(', ')}], field weather=${snap.field.weather?.id || 'none'}`);
 				allNodes.push({
 					timelineId: globalId,
 					timelineNum: entry.num,
@@ -1091,10 +1250,14 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 					ended,
 					p1Team: snap.p1Team.map(toClientSnapshot),
 					p2Team: snap.p2Team.map(toClientSnapshot),
+					p1SideConditions: snap.p1SideConditions,
+					p2SideConditions: snap.p2SideConditions,
+					field: snap.field,
 				});
 			}
 		}
 
+		console.log(`[Timeline Nodes] Generated ${allNodes.length} total nodes`);
 		return { nodes: allNodes };
 	}
 
@@ -1142,5 +1305,54 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 
 		const snap = history.get(closestTurn)!;
 		return side === 'p1' ? snap.p1Team : snap.p2Team;
+	}
+
+	/**
+	 * Retrieves stored side conditions for a timeline at a given turn.
+	 */
+	getStoredSideConditions(timelineId: string, turn: number, side: 'p1' | 'p2'): SideConditionSnapshot[] | null {
+		const history = this.turnSnapshots.get(timelineId);
+		if (!history) {
+			console.log(`[Timeline Side] getStoredSideConditions: no history for ${timelineId}`);
+			return null;
+		}
+
+		let closestTurn = -1;
+		for (const [t] of history) {
+			if (t <= turn && t > closestTurn) closestTurn = t;
+		}
+		if (closestTurn === -1) {
+			console.log(`[Timeline Side] getStoredSideConditions: no turn <= ${turn} in history`);
+			return null;
+		}
+
+		const snap = history.get(closestTurn)!;
+		const conditions = side === 'p1' ? snap.p1SideConditions : snap.p2SideConditions;
+		console.log(`[Timeline Side] getStoredSideConditions("${timelineId}", turn=${turn}, side=${side}) -> ${conditions.length} conditions from turn ${closestTurn}`);
+		return conditions;
+	}
+
+	/**
+	 * Retrieves stored field snapshot for a timeline at a given turn.
+	 */
+	getStoredField(timelineId: string, turn: number): FieldSnapshot | null {
+		const history = this.turnSnapshots.get(timelineId);
+		if (!history) {
+			console.log(`[Timeline Field] getStoredField: no history for ${timelineId}`);
+			return null;
+		}
+
+		let closestTurn = -1;
+		for (const [t] of history) {
+			if (t <= turn && t > closestTurn) closestTurn = t;
+		}
+		if (closestTurn === -1) {
+			console.log(`[Timeline Field] getStoredField: no turn <= ${turn} in history`);
+			return null;
+		}
+
+		const snap = history.get(closestTurn)!;
+		console.log(`[Timeline Field] getStoredField("${timelineId}", turn=${turn}) -> weather=${snap.field.weather?.id || 'none'}, terrain=${snap.field.terrain?.id || 'none'} from turn ${closestTurn}`);
+		return snap.field;
 	}
 }

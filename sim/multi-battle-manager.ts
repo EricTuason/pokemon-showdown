@@ -386,8 +386,8 @@ export class MultiBattleManager {
 
 	/**
 	 * Removes the active Pokémon from a side after its state has already been
-	 * captured for transfer. Decrements pokemonLeft and clears the active slot.
-	 * Does NOT call extractPokemon (which also zeros HP / marks fnt).
+	 * captured for transfer. Completely removes it from the team roster
+	 * rather than marking it as fainted.
 	 */
 	removePokemonAfterCapture(battleId: string, side: 'p1' | 'p2', position: number = 0): boolean {
 		const battle = this.getBattle(battleId);
@@ -398,15 +398,35 @@ export class MultiBattleManager {
 		const pokemon = battleSide.active[position];
 		if (!pokemon || pokemon.fainted) return false;
 
-		pokemon.fainted = true;
-		pokemon.faintQueued = false;
-		pokemon.hp = 0;
+		// Clear the active slot first
 		pokemon.isActive = false;
-		pokemon.status = 'fnt' as any;
 		battleSide.active[position] = null as any;
+
+		// Find and remove from the team roster entirely
+		const teamIndex = battleSide.pokemon.indexOf(pokemon);
+		if (teamIndex !== -1) {
+			battleSide.pokemon.splice(teamIndex, 1);
+
+			// Reindex positions for remaining Pokémon so the battle engine
+			// doesn't reference stale slot numbers
+			for (let i = 0; i < battleSide.pokemon.length; i++) {
+				battleSide.pokemon[i].position = i;
+			}
+		}
+
+		// Also remove from the packed team array if it exists,
+		// so team preview / switch menus stay consistent
+		if (battleSide.team && teamIndex !== -1) {
+			battleSide.team.splice(teamIndex, 1);
+		}
+
+		// Decrement pokemonLeft — this Pokémon is gone, not fainted
 		battleSide.pokemonLeft = Math.max(0, battleSide.pokemonLeft - 1);
 
-		console.log(`[Timeline Team] removePokemonAfterCapture: ${pokemon.name} removed from ${side}, pokemonLeft=${battleSide.pokemonLeft}`);
+		console.log(
+			`[Timeline Team] removePokemonAfterCapture: ${pokemon.name} fully removed from ${side}, ` +
+			`team size=${battleSide.pokemon.length}, pokemonLeft=${battleSide.pokemonLeft}`
+		);
 		return true;
 	}
 

@@ -52,6 +52,20 @@ export interface SlotConditionSnapshot {
 	source?: string;
 }
 
+/**
+ * The full shape of a turn snapshot entry stored in turnSnapshots.
+ * Used by captureSnapshot, deepCloneTurnSnapshot, and the branch handler.
+ */
+type TurnSnapshotEntry = {
+	p1Team: PokemonSnapshot[];
+	p2Team: PokemonSnapshot[];
+	p1Sets: PokemonSet[];
+	p2Sets: PokemonSet[];
+	p1SideConditions: SideConditionSnapshot[];
+	p2SideConditions: SideConditionSnapshot[];
+	field: FieldSnapshot;
+};
+
 function pokemonToSpriteId(pokemon: any): string {
 	const name: string =
 		pokemon.species?.name ||
@@ -277,23 +291,7 @@ function deepCloneSet(s: PokemonSet): PokemonSet {
 /**
  * Deep-clones a full turn snapshot entry.
  */
-function deepCloneTurnSnapshot(snap: {
-	p1Team: PokemonSnapshot[];
-	p2Team: PokemonSnapshot[];
-	p1Sets: PokemonSet[];
-	p2Sets: PokemonSet[];
-	p1SideConditions: SideConditionSnapshot[];
-	p2SideConditions: SideConditionSnapshot[];
-	field: FieldSnapshot;
-}): {
-	p1Team: PokemonSnapshot[];
-	p2Team: PokemonSnapshot[];
-	p1Sets: PokemonSet[];
-	p2Sets: PokemonSet[];
-	p1SideConditions: SideConditionSnapshot[];
-	p2SideConditions: SideConditionSnapshot[];
-	field: FieldSnapshot;
-} {
+function deepCloneTurnSnapshot(snap: TurnSnapshotEntry): TurnSnapshotEntry {
 	return {
 		p1Team: snap.p1Team.map(deepCloneSnapshot),
 		p2Team: snap.p2Team.map(deepCloneSnapshot),
@@ -379,15 +377,7 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 		this.battle = null;
 	}
 
-	private turnSnapshots: Map<string, Map<number, {
-		p1Team: PokemonSnapshot[];
-		p2Team: PokemonSnapshot[];
-		p1Sets: PokemonSet[];
-		p2Sets: PokemonSet[];
-		p1SideConditions: SideConditionSnapshot[];
-		p2SideConditions: SideConditionSnapshot[];
-		field: FieldSnapshot;
-	}>> = new Map();
+	private turnSnapshots: Map<string, Map<number, TurnSnapshotEntry>> = new Map();
 
 	private captureSnapshot(timelineId: string, battle: any) {
 		if (!battle) return;
@@ -1162,20 +1152,17 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 
 				const newTimeline = this.registerTimeline(newBattleId, currentEntry.num, turn);
 
+				// ── FIX: use the TurnSnapshotEntry alias so TS accepts the assignment ──
 				const parentHistory = this.turnSnapshots.get(this.battle.currentTimelineId);
 				if (parentHistory) {
-					const newHistory = new Map<number, {
-						p1Team: PokemonSnapshot[];
-						p2Team: PokemonSnapshot[];
-						p1Sets: PokemonSet[];
-						p2Sets: PokemonSet[];
-					}>();
+					const newHistory = new Map<number, TurnSnapshotEntry>();
 					for (const [t, snap] of parentHistory) {
 						if (t <= turn) {
 							newHistory.set(t, deepCloneTurnSnapshot(snap));
 						}
 					}
 					this.turnSnapshots.set(newTimeline.globalId, newHistory);
+					console.log(`[Timeline Snapshot] Branch inherited ${newHistory.size} snapshots from parent (turns <= ${turn})`);
 				}
 
 				this.hookBattleSend(newTimeline.globalId, newBattle);
@@ -1257,7 +1244,6 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 			}
 		}
 
-		console.log(`[Timeline Nodes] Generated ${allNodes.length} total nodes`);
 		return { nodes: allNodes };
 	}
 

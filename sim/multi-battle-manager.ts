@@ -585,30 +585,25 @@ export class MultiBattleManager {
 		// Apply HP (capped at maxhp)
 		pokemon.hp = Math.min(state.hp, pokemon.maxhp);
 		console.log(`[Timeline Team]   Applied HP: ${pokemon.hp}/${pokemon.maxhp}`);
-		
-		// Apply status
+
+		// ── FIX: silent status assignment instead of setStatus() ──
+		// setStatus() emits |-status| before the client sees |switch|,
+		// causing "Cannot set properties of null" on the client.
 		if (state.status && state.status !== '') {
-			pokemon.setStatus(state.status as any);
-			// Copy status state properties
-			for (const key in state.statusState) {
-				if (key !== 'id' && key !== 'target') {
-					pokemon.statusState[key] = state.statusState[key];
-				}
-			}
-			console.log(`[Timeline Team]   Applied status: ${state.status}`);
+			this.setStatusSilently(pokemon, state.status, battle, state.statusState);
 		}
-		
+
 		// Apply boosts
 		pokemon.boosts = { ...state.boosts };
 		console.log(`[Timeline Team]   Applied boosts: ${JSON.stringify(pokemon.boosts)}`);
-		
+
 		// Apply volatiles (skip battle-specific ones that won't transfer well)
 		const skipVolatiles = new Set([
 			'mustrecharge', 'lockedmove', 'twoturnmove', 'choicelock',
 			'flinch', 'destinybond', 'grudge', 'endure',
 			'stall', 'gem', 'roost', 'protect', 'quickguard', 'wideguard'
 		]);
-		
+
 		const appliedVolatiles: string[] = [];
 		for (const id in state.volatiles) {
 			if (skipVolatiles.has(id)) continue;
@@ -618,7 +613,7 @@ export class MultiBattleManager {
 			appliedVolatiles.push(id);
 		}
 		console.log(`[Timeline Team]   Applied volatiles: [${appliedVolatiles.join(', ')}]`);
-		
+
 		// Apply move PP - match by move id
 		for (const stateSlot of state.moveSlots) {
 			for (const pokemonSlot of pokemon.moveSlots) {
@@ -631,18 +626,61 @@ export class MultiBattleManager {
 				}
 			}
 		}
-		
+
 		// Apply tracking stats
 		pokemon.timesAttacked = state.timesAttacked;
 		pokemon.lastDamage = state.lastDamage;
-		
+
 		// Apply type changes if any
 		if (state.addedType) {
 			pokemon.addedType = state.addedType;
 			console.log(`[Timeline Team]   Applied addedType: ${state.addedType}`);
 		}
 
-		console.log(`[Timeline Team]   Final Pokemon state - HP: ${pokemon.hp}/${pokemon.maxhp}, Moves: ${pokemon.moveSlots.map((m: any) => `${m.id}(${m.pp}/${m.maxpp})`).join(', ')}`);
+		console.log(`[Timeline Team]   Final Pokemon state - HP: ${pokemon.hp}/${pokemon.maxhp}, Status: ${pokemon.status || 'none'}, Moves: ${pokemon.moveSlots.map((m: any) => `${m.id}(${m.pp}/${m.maxpp})`).join(', ')}`);
+	}
+
+
+	/**
+	 * Sets a Pokemon's status WITHOUT triggering events or protocol emission.
+	 *
+	 * This must be used during state restoration instead of pokemon.setStatus(),
+	 * because setStatus() emits `|-status|` protocol messages. If that happens
+	 * before the client has received a `|switch|` for this Pokemon, the client's
+	 * active slot is still null and it crashes with:
+	 *   "TypeError: Cannot set properties of null (setting 'status')"
+	 *
+	 * The status will be visible to the client once |switch| is sent, because
+	 * the switch protocol line includes the condition string (e.g. "100/100 brn").
+	 */
+	private setStatusSilently(pokemon: Pokemon, status: string, battle: Battle, statusState?: EffectState): void {
+		if (!status || status === '') {
+			console.log(`[Timeline Status] setStatusSilently: empty status for ${pokemon.name}, skipping`);
+			return;
+		}
+
+		const prevStatus = pokemon.status;
+		console.log(`[Timeline Status] setStatusSilently: ${pokemon.name} ${prevStatus || 'none'} -> ${status}`);
+
+		// Direct assignment — no events, no protocol output
+		pokemon.status = status as any;
+
+		// Build a valid statusState so duration counters (toxic, sleep) work correctly
+		if (statusState) {
+			// Restore the full saved state, but retarget to THIS pokemon
+			// (don't leak references to a Pokemon from another battle!)
+			const cleanState: EffectState = { id: status as any, target: pokemon, effectOrder: 0 };
+			for (const key in statusState) {
+				if (key === 'target' || key === 'source') continue; // skip cross-battle references
+				cleanState[key] = statusState[key];
+			}
+			pokemon.statusState = cleanState;
+			console.log(`[Timeline Status]   Restored statusState keys: [${Object.keys(cleanState).join(', ')}]`);
+		} else {
+			// No saved state — just initialize a fresh one
+			pokemon.statusState = battle.initEffectState({ id: status as any, target: pokemon });
+			console.log(`[Timeline Status]   Initialized fresh statusState for ${status}`);
+		}
 	}
 
 	/**
@@ -1220,8 +1258,11 @@ export class MultiBattleManager {
 					console.log(`[Timeline Team]   ${pokemon.name} - fainted (from snapshot)`);
 				} else {
 					pokemon.hp = Math.max(1, Math.round((display.hp / 100) * pokemon.maxhp));
-					if (display.status) pokemon.setStatus(display.status as any);
-					console.log(`[Timeline Team]   ${pokemon.name} HP: ${pokemon.hp}/${pokemon.maxhp} (${display.hp}%)`);
+					// ── FIX: silent status on bench mons (they won't even be switched in) ──
+					if (display.status) {
+						this.setStatusSilently(pokemon, display.status, battle);
+					}
+					console.log(`[Timeline Team]   ${pokemon.name} HP: ${pokemon.hp}/${pokemon.maxhp} (${display.hp}%), status: ${display.status || 'none'}`);
 				}
 			} else {
 				console.log(`[Timeline Team]   ${pokemon.name} - no display data, keeping full HP`);
@@ -1369,9 +1410,9 @@ export class MultiBattleManager {
 					// Apply HP (stored as percentage)
 					pokemon.hp = Math.max(1, Math.round((display.hp / 100) * pokemon.maxhp));
 
-					// Apply status
+					// ── FIX: silent status — no protocol until switchIn sends |switch| ──
 					if (display.status && display.status !== '') {
-						pokemon.setStatus(display.status as any);
+						this.setStatusSilently(pokemon, display.status, battle);
 					}
 
 					console.log(`[Timeline Team]   ${pokemon.name} HP: ${pokemon.hp}/${pokemon.maxhp} (${display.hp}%), status: ${display.status || 'none'}`);

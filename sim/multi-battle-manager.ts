@@ -1,9 +1,9 @@
 /**
  * Multi-Battle Manager
- * 
+ *
  * A system for running multiple Pokemon battles that can affect each other.
  * Built on top of the Pokemon Showdown battle simulator.
- * 
+ *
  * Key feature: Transfer Pokemon between battles while preserving their state.
  */
 
@@ -48,13 +48,13 @@ interface MoveSlotState {
 export interface PokemonTransferState {
 	// The original set (for recreating the Pokemon)
 	set: PokemonSet;
-	
+
 	// Current battle state
 	hp: number;
 	maxhp: number;
 	status: string;
 	statusState: EffectState;
-	
+
 	// Stat boosts
 	boosts: {
 		atk: number;
@@ -65,33 +65,74 @@ export interface PokemonTransferState {
 		accuracy: number;
 		evasion: number;
 	};
-	
+
 	// Volatile conditions
 	volatiles: { [id: string]: EffectState };
-	
+
 	// Move PP and state
 	moveSlots: MoveSlotState[];
-	
+
 	// Ability and item state
 	ability: string;
 	abilityState: EffectState;
 	item: string;
 	itemState: EffectState;
 	lastItem: string;
-	
+
 	// Tracking stats
 	timesAttacked: number;
 	lastDamage: number;
-	
+
 	// Species info (in case of forme changes)
 	species: string;
-	
+
 	// Types (in case of type changes)
 	types: string[];
 	addedType: string;
-	
+
 	// Transform state
 	transformed: boolean;
+}
+
+/**
+ * Snapshot of a single field-level condition (weather, terrain, or a
+ * pseudo-weather entry like Trick Room).
+ */
+export interface FieldConditionSnapshot {
+	id: string;
+	turnsLeft?: number;
+	source?: string;      // Pokemon name, not a reference
+	sourceSlot?: string;  // e.g. "p1a"
+}
+
+/**
+ * Snapshot of the entire battle field.
+ */
+export interface FieldSnapshot {
+	weather: FieldConditionSnapshot | null;
+	terrain: FieldConditionSnapshot | null;
+	pseudoWeather: FieldConditionSnapshot[];
+}
+
+/**
+ * Snapshot of a side condition (Stealth Rock, Reflect, Spikes, etc.).
+ */
+export interface SideConditionSnapshot {
+	id: string;
+	turnsLeft?: number;
+	layers?: number;      // For stackable conditions (Spikes, Toxic Spikes)
+	source?: string;      // Pokemon name
+	sourceSlot?: string;
+}
+
+/**
+ * Snapshot of a slot condition (Wish, Healing Wish, Future Sight, etc.).
+ */
+export interface SlotConditionSnapshot {
+	id: string;
+	turnsLeft?: number;
+	source?: string;
+	sourceSlot?: string;
 }
 
 export interface BattleSnapshot {
@@ -131,43 +172,6 @@ export interface PokemonSnapshot {
 	moves: string[];
 	position: number;
 	volatiles: string[];
-}
-
-/**
- * Snapshot of a field condition (weather, terrain, or pseudo-weather)
- */
-export interface FieldConditionSnapshot {
-	id: string;
-	turnsLeft?: number;
-	source?: string;  // Pokemon that set it, if any
-}
-
-/**
- * Snapshot of the battle field state
- */
-export interface FieldSnapshot {
-	weather: FieldConditionSnapshot | null;
-	terrain: FieldConditionSnapshot | null;
-	pseudoWeather: FieldConditionSnapshot[];
-}
-
-/**
- * Snapshot of a side condition (e.g., Stealth Rock, Reflect, Spikes)
- */
-export interface SideConditionSnapshot {
-	id: string;
-	turnsLeft?: number;
-	layers?: number;  // For stackable conditions like Spikes
-	source?: string;
-}
-
-/**
- * Snapshot of a slot condition (e.g., Wish, Healing Wish)
- */
-export interface SlotConditionSnapshot {
-	id: string;
-	turnsLeft?: number;
-	source?: string;
 }
 
 /**
@@ -223,7 +227,7 @@ function ensureCompletePokemonSet(partialSet: Partial<PokemonSet>): PokemonSet {
 		ivs: partialSet.ivs || { hp: 31, atk: 31, def: 31, spa: 31, spd: 31, spe: 31 },
 		level: partialSet.level || 100,
 	};
-	
+
 	// Ensure EVs have all stats
 	if (!set.evs.hp && set.evs.hp !== 0) set.evs.hp = 0;
 	if (!set.evs.atk && set.evs.atk !== 0) set.evs.atk = 0;
@@ -231,7 +235,7 @@ function ensureCompletePokemonSet(partialSet: Partial<PokemonSet>): PokemonSet {
 	if (!set.evs.spa && set.evs.spa !== 0) set.evs.spa = 0;
 	if (!set.evs.spd && set.evs.spd !== 0) set.evs.spd = 0;
 	if (!set.evs.spe && set.evs.spe !== 0) set.evs.spe = 0;
-	
+
 	// Ensure IVs have all stats
 	if (!set.ivs.hp && set.ivs.hp !== 0) set.ivs.hp = 31;
 	if (!set.ivs.atk && set.ivs.atk !== 0) set.ivs.atk = 31;
@@ -239,7 +243,7 @@ function ensureCompletePokemonSet(partialSet: Partial<PokemonSet>): PokemonSet {
 	if (!set.ivs.spa && set.ivs.spa !== 0) set.ivs.spa = 31;
 	if (!set.ivs.spd && set.ivs.spd !== 0) set.ivs.spd = 31;
 	if (!set.ivs.spe && set.ivs.spe !== 0) set.ivs.spe = 31;
-	
+
 	// Copy optional fields
 	if (partialSet.shiny !== undefined) set.shiny = partialSet.shiny;
 	if (partialSet.happiness !== undefined) set.happiness = partialSet.happiness;
@@ -248,7 +252,7 @@ function ensureCompletePokemonSet(partialSet: Partial<PokemonSet>): PokemonSet {
 	if (partialSet.dynamaxLevel !== undefined) set.dynamaxLevel = partialSet.dynamaxLevel;
 	if (partialSet.gigantamax !== undefined) set.gigantamax = partialSet.gigantamax;
 	if (partialSet.teraType !== undefined) set.teraType = partialSet.teraType;
-	
+
 	return set;
 }
 
@@ -324,7 +328,7 @@ export class MultiBattleManager {
 	 */
 	setPlayer(battleId: string, slot: 'p1' | 'p2' | 'p3' | 'p4', options: PlayerOptions): void {
 		console.log(`[Timeline Team] setPlayer called - battleId: "${battleId}", slot: "${slot}", name: "${options.name}"`);
-		
+
 		const battle = this.getBattle(battleId);
 		if (!battle) {
 			throw new Error(`Battle "${battleId}" not found`);
@@ -332,13 +336,13 @@ export class MultiBattleManager {
 
 		let team = options.team;
 		let teamInfo = 'none';
-		
+
 		if (typeof team === 'object' && Array.isArray(team)) {
 			console.log(`[Timeline Team] setPlayer received array team with ${team.length} Pokemon:`);
 			team.forEach((set, i) => {
 				console.log(`[Timeline Team]   [${i}] ${set.name || set.species} - ${set.moves?.join(', ') || 'no moves'}`);
 			});
-			
+
 			// Ensure all sets are complete before packing
 			team = team.map(set => ensureCompletePokemonSet(set));
 			const packedTeam = Teams.pack(team);
@@ -353,7 +357,7 @@ export class MultiBattleManager {
 		}
 
 		console.log(`[Timeline Team] Calling battle.setPlayer for ${slot} with team type: ${teamInfo}`);
-		
+
 		battle.setPlayer(slot, {
 			name: options.name,
 			team: team as string | undefined,
@@ -394,7 +398,7 @@ export class MultiBattleManager {
 	 */
 	linkBattles(battleId1: string, battleId2: string, bidirectional: boolean = true): void {
 		console.log(`[Timeline Team] linkBattles("${battleId1}", "${battleId2}", bidirectional=${bidirectional})`);
-		
+
 		const links1 = this.battleLinks.get(battleId1) || [];
 		if (!links1.includes(battleId2)) {
 			links1.push(battleId2);
@@ -481,7 +485,7 @@ export class MultiBattleManager {
 			logs.push(data);
 		}
 		this.battleLogs.set(battleId, logs);
-		
+
 		// Log team-related messages
 		const dataStr = Array.isArray(data) ? data.join('\n') : data;
 		if (dataStr.includes('|switch|') || dataStr.includes('|drag|') || dataStr.includes('|poke|') || dataStr.includes('|teampreview|')) {
@@ -545,25 +549,25 @@ export class MultiBattleManager {
 
 		const state: PokemonTransferState = {
 			set: { ...pokemon.set },
-			
+
 			hp: pokemon.hp,
 			maxhp: pokemon.maxhp,
 			status: pokemon.status,
 			statusState: { ...pokemon.statusState },
-			
+
 			boosts: { ...pokemon.boosts },
 			volatiles: volatiles,
 			moveSlots: moveSlots,
-			
+
 			ability: pokemon.ability,
 			abilityState: { ...pokemon.abilityState },
 			item: pokemon.item,
 			itemState: { ...pokemon.itemState },
 			lastItem: pokemon.lastItem,
-			
+
 			timesAttacked: pokemon.timesAttacked,
 			lastDamage: pokemon.lastDamage,
-			
+
 			species: pokemon.species.id,
 			types: [...pokemon.types],
 			addedType: pokemon.addedType,
@@ -572,6 +576,43 @@ export class MultiBattleManager {
 
 		console.log(`[Timeline Team] Captured PokemonTransferState - set.species: ${state.set.species}, set.moves: [${state.set.moves?.join(', ')}]`);
 		return state;
+	}
+
+	/**
+	 * Sets a Pokemon's status WITHOUT triggering events or protocol emission.
+	 *
+	 * Status restoration must bypass pokemon.setStatus() because setStatus()
+	 * emits `|-status|` protocol lines. If that reaches the client before the
+	 * corresponding `|switch|` line, the client's active slot is still null
+	 * and it crashes trying to set `.status` on null.
+	 *
+	 * The status reaches the client embedded in the |switch| line's
+	 * condition string (e.g. "100/100 brn").
+	 */
+	private setStatusSilently(pokemon: Pokemon, status: string, battle: Battle, statusState?: EffectState): void {
+		if (!status || status === '') {
+			console.log(`[Timeline Status] setStatusSilently: empty status for ${pokemon.name}, skipping`);
+			return;
+		}
+
+		const prevStatus = pokemon.status;
+		console.log(`[Timeline Status] setStatusSilently: ${pokemon.name} ${prevStatus || 'none'} -> ${status}`);
+
+		pokemon.status = status as any;
+
+		if (statusState) {
+			// Retarget to this Pokemon; drop cross-battle Pokemon references
+			const cleanState: EffectState = { id: status as any, target: pokemon, effectOrder: 0 };
+			for (const key in statusState) {
+				if (key === 'target' || key === 'source') continue;
+				cleanState[key] = statusState[key];
+			}
+			pokemon.statusState = cleanState;
+			console.log(`[Timeline Status]   Restored statusState keys: [${Object.keys(cleanState).join(', ')}]`);
+		} else {
+			pokemon.statusState = battle.initEffectState({ id: status as any, target: pokemon });
+			console.log(`[Timeline Status]   Initialized fresh statusState for ${status}`);
+		}
 	}
 
 	/**
@@ -586,9 +627,7 @@ export class MultiBattleManager {
 		pokemon.hp = Math.min(state.hp, pokemon.maxhp);
 		console.log(`[Timeline Team]   Applied HP: ${pokemon.hp}/${pokemon.maxhp}`);
 
-		// ── FIX: silent status assignment instead of setStatus() ──
-		// setStatus() emits |-status| before the client sees |switch|,
-		// causing "Cannot set properties of null" on the client.
+		// Silent status assignment: no events, no protocol until |switch|
 		if (state.status && state.status !== '') {
 			this.setStatusSilently(pokemon, state.status, battle, state.statusState);
 		}
@@ -640,47 +679,227 @@ export class MultiBattleManager {
 		console.log(`[Timeline Team]   Final Pokemon state - HP: ${pokemon.hp}/${pokemon.maxhp}, Status: ${pokemon.status || 'none'}, Moves: ${pokemon.moveSlots.map((m: any) => `${m.id}(${m.pp}/${m.maxpp})`).join(', ')}`);
 	}
 
+	/**
+	 * Searches all sides of a battle for a Pokemon by name.
+	 * Used to reconnect `source` references on restored EffectStates.
+	 * Returns null if not found (common when called before team rebuild).
+	 */
+	private findPokemonByName(battle: Battle, name: string | undefined): Pokemon | null {
+		if (!name) return null;
+		const nameLower = name.toLowerCase();
+		for (const side of battle.sides) {
+			if (!side) continue;
+			for (const pokemon of side.pokemon) {
+				if (pokemon && pokemon.name.toLowerCase() === nameLower) {
+					return pokemon;
+				}
+			}
+		}
+		return null;
+	}
 
 	/**
-	 * Sets a Pokemon's status WITHOUT triggering events or protocol emission.
+	 * Replaces the battle's field state (weather, terrain, pseudo-weather)
+	 * with a snapshot, without firing onFieldStart/onFieldEnd events or
+	 * emitting |-weather| / |-fieldstart| protocol lines.
 	 *
-	 * This must be used during state restoration instead of pokemon.setStatus(),
-	 * because setStatus() emits `|-status|` protocol messages. If that happens
-	 * before the client has received a `|switch|` for this Pokemon, the client's
-	 * active slot is still null and it crashes with:
-	 *   "TypeError: Cannot set properties of null (setting 'status')"
-	 *
-	 * The status will be visible to the client once |switch| is sent, because
-	 * the switch protocol line includes the condition string (e.g. "100/100 brn").
+	 * Passing null clears the field entirely. Call this ONCE per restore
+	 * operation (field is battle-scoped, not side-scoped).
 	 */
-	private setStatusSilently(pokemon: Pokemon, status: string, battle: Battle, statusState?: EffectState): void {
-		if (!status || status === '') {
-			console.log(`[Timeline Status] setStatusSilently: empty status for ${pokemon.name}, skipping`);
-			return;
+	restoreFieldSilently(battleId: string, snapshot: FieldSnapshot | null): boolean {
+		const battle = this.getBattle(battleId);
+		if (!battle) {
+			console.log(`[Timeline Restore] restoreFieldSilently: battle "${battleId}" not found`);
+			return false;
 		}
 
-		const prevStatus = pokemon.status;
-		console.log(`[Timeline Status] setStatusSilently: ${pokemon.name} ${prevStatus || 'none'} -> ${status}`);
+		const field = battle.field;
+		console.log(`[Timeline Restore] restoreFieldSilently("${battleId}")`);
+		console.log(`[Timeline Restore]   Before: weather=${field.weather || 'none'}, terrain=${field.terrain || 'none'}, pseudoWeather=[${Object.keys(field.pseudoWeather).join(', ')}]`);
 
-		// Direct assignment — no events, no protocol output
-		pokemon.status = status as any;
+		// ── Clear everything first ──
+		field.weather = '' as any;
+		field.weatherState = battle.initEffectState({ id: '' });
+		field.terrain = '' as any;
+		field.terrainState = battle.initEffectState({ id: '' });
+		field.pseudoWeather = {};
 
-		// Build a valid statusState so duration counters (toxic, sleep) work correctly
-		if (statusState) {
-			// Restore the full saved state, but retarget to THIS pokemon
-			// (don't leak references to a Pokemon from another battle!)
-			const cleanState: EffectState = { id: status as any, target: pokemon, effectOrder: 0 };
-			for (const key in statusState) {
-				if (key === 'target' || key === 'source') continue; // skip cross-battle references
-				cleanState[key] = statusState[key];
+		if (!snapshot) {
+			console.log(`[Timeline Restore]   Null snapshot: field cleared`);
+			return true;
+		}
+
+		// ── Weather ──
+		if (snapshot.weather && snapshot.weather.id) {
+			const src = this.findPokemonByName(battle, snapshot.weather.source);
+			field.weather = snapshot.weather.id as any;
+			field.weatherState = battle.initEffectState({
+				id: snapshot.weather.id as any,
+				source: src,
+				sourceSlot: snapshot.weather.sourceSlot,
+				duration: snapshot.weather.turnsLeft,
+			});
+			console.log(`[Timeline Restore]   Weather restored: ${snapshot.weather.id}, duration=${snapshot.weather.turnsLeft ?? 'infinite'}, source=${src?.name || `null(was "${snapshot.weather.source}")`}`);
+		}
+
+		// ── Terrain ──
+		if (snapshot.terrain && snapshot.terrain.id) {
+			const src = this.findPokemonByName(battle, snapshot.terrain.source);
+			field.terrain = snapshot.terrain.id as any;
+			field.terrainState = battle.initEffectState({
+				id: snapshot.terrain.id as any,
+				source: src,
+				sourceSlot: snapshot.terrain.sourceSlot,
+				duration: snapshot.terrain.turnsLeft,
+			});
+			console.log(`[Timeline Restore]   Terrain restored: ${snapshot.terrain.id}, duration=${snapshot.terrain.turnsLeft ?? 'infinite'}, source=${src?.name || `null(was "${snapshot.terrain.source}")`}`);
+		}
+
+		// ── Pseudo-weather ──
+		for (const pw of snapshot.pseudoWeather) {
+			if (!pw.id) continue;
+			const src = this.findPokemonByName(battle, pw.source);
+			field.pseudoWeather[pw.id] = battle.initEffectState({
+				id: pw.id as any,
+				source: src,
+				sourceSlot: pw.sourceSlot,
+				duration: pw.turnsLeft,
+			});
+			console.log(`[Timeline Restore]   PseudoWeather restored: ${pw.id}, duration=${pw.turnsLeft ?? 'infinite'}, source=${src?.name || `null(was "${pw.source}")`}`);
+		}
+
+		console.log(`[Timeline Restore]   After: weather=${field.weather || 'none'}, terrain=${field.terrain || 'none'}, pseudoWeather=[${Object.keys(field.pseudoWeather).join(', ')}]`);
+		return true;
+	}
+
+	/**
+	 * Replaces one side's sideConditions dict with a snapshot, without
+	 * firing onSideStart/onSideEnd events or emitting |-sidestart| /
+	 * |-sideend| protocol lines.
+	 *
+	 * Passing null or an empty array clears all side conditions. Stale
+	 * conditions are always cleared before the snapshot is applied.
+	 */
+	restoreSideConditionsSilently(
+		battleId: string,
+		sideId: 'p1' | 'p2',
+		conditions: SideConditionSnapshot[] | null
+	): boolean {
+		const battle = this.getBattle(battleId);
+		if (!battle) {
+			console.log(`[Timeline Restore] restoreSideConditionsSilently: battle "${battleId}" not found`);
+			return false;
+		}
+
+		const side = battle[sideId];
+		if (!side) {
+			console.log(`[Timeline Restore] restoreSideConditionsSilently: side "${sideId}" not found`);
+			return false;
+		}
+
+		const before = Object.keys(side.sideConditions);
+		console.log(`[Timeline Restore] restoreSideConditionsSilently("${battleId}", "${sideId}")`);
+		console.log(`[Timeline Restore]   Before: [${before.join(', ')}]`);
+
+		// ── Clear all stale conditions ──
+		side.sideConditions = {};
+
+		if (!conditions || conditions.length === 0) {
+			console.log(`[Timeline Restore]   Empty snapshot: side conditions cleared`);
+			return true;
+		}
+
+		// ── Rebuild from snapshot ──
+		for (const cond of conditions) {
+			if (!cond.id) continue;
+			const src = this.findPokemonByName(battle, cond.source);
+
+			const state = battle.initEffectState({
+				id: cond.id as any,
+				target: side,
+				source: src,
+				sourceSlot: cond.sourceSlot,
+				duration: cond.turnsLeft,
+			});
+
+			// layers lives directly on the EffectState for stackable conditions
+			if (cond.layers !== undefined) {
+				state.layers = cond.layers;
 			}
-			pokemon.statusState = cleanState;
-			console.log(`[Timeline Status]   Restored statusState keys: [${Object.keys(cleanState).join(', ')}]`);
-		} else {
-			// No saved state — just initialize a fresh one
-			pokemon.statusState = battle.initEffectState({ id: status as any, target: pokemon });
-			console.log(`[Timeline Status]   Initialized fresh statusState for ${status}`);
+
+			side.sideConditions[cond.id] = state;
+			console.log(`[Timeline Restore]   Restored ${cond.id}: duration=${cond.turnsLeft ?? 'N/A'}, layers=${cond.layers ?? 'N/A'}, source=${src?.name || `null(was "${cond.source}")`}`);
 		}
+
+		console.log(`[Timeline Restore]   After: [${Object.keys(side.sideConditions).join(', ')}]`);
+		return true;
+	}
+
+	/**
+	 * Replaces one side's slotConditions with a snapshot, without firing
+	 * events. Call this AFTER replaceTeamFromSnapshot / restoreTeamFromSnapshot,
+	 * since those methods reset slotConditions to empty during team rebuild.
+	 *
+	 * Passing null or an empty object leaves the slots cleared.
+	 */
+	restoreSlotConditionsSilently(
+		battleId: string,
+		sideId: 'p1' | 'p2',
+		slotConditions: { [slot: number]: SlotConditionSnapshot[] } | null
+	): boolean {
+		const battle = this.getBattle(battleId);
+		if (!battle) {
+			console.log(`[Timeline Restore] restoreSlotConditionsSilently: battle "${battleId}" not found`);
+			return false;
+		}
+
+		const side = battle[sideId];
+		if (!side) {
+			console.log(`[Timeline Restore] restoreSlotConditionsSilently: side "${sideId}" not found`);
+			return false;
+		}
+
+		console.log(`[Timeline Slot] restoreSlotConditionsSilently("${battleId}", "${sideId}")`);
+
+		// Ensure the slotConditions array is at least as long as active slots
+		if (!side.slotConditions) side.slotConditions = [];
+		for (let i = 0; i < side.active.length; i++) {
+			if (!side.slotConditions[i]) side.slotConditions[i] = {};
+		}
+
+		if (!slotConditions || Object.keys(slotConditions).length === 0) {
+			console.log(`[Timeline Slot]   Empty snapshot: slot conditions left cleared`);
+			return true;
+		}
+
+		let restored = 0;
+		for (const slotStr in slotConditions) {
+			const slot = parseInt(slotStr, 10);
+			if (isNaN(slot)) continue;
+
+			// Ensure the slot exists
+			if (!side.slotConditions[slot]) side.slotConditions[slot] = {};
+
+			const condsForSlot = slotConditions[slot];
+			for (const cond of condsForSlot) {
+				if (!cond.id) continue;
+				const src = this.findPokemonByName(battle, cond.source);
+
+				side.slotConditions[slot][cond.id] = battle.initEffectState({
+					id: cond.id as any,
+					target: side,
+					source: src,
+					sourceSlot: cond.sourceSlot,
+					isSlotCondition: true,
+					duration: cond.turnsLeft,
+				});
+				restored++;
+				console.log(`[Timeline Slot]   Restored slot ${slot}: ${cond.id}, duration=${cond.turnsLeft ?? 'N/A'}, source=${src?.name || `null(was "${cond.source}")`}`);
+			}
+		}
+
+		console.log(`[Timeline Slot]   Total restored: ${restored} slot condition(s)`);
+		return true;
 	}
 
 	/**
@@ -693,7 +912,7 @@ export class MultiBattleManager {
 		position: number = 0
 	): { success: boolean; state?: PokemonTransferState; error?: string } {
 		console.log(`[Timeline Team] extractPokemon("${battleId}", "${side}", ${position})`);
-		
+
 		const battle = this.getBattle(battleId);
 		if (!battle) {
 			console.log(`[Timeline Team] extractPokemon FAILED: Battle not found`);
@@ -730,14 +949,14 @@ export class MultiBattleManager {
 
 		// Mark the Pokemon as unavailable in this battle
 		battle.add('', `${pokemon.name} was transferred out of the battle!`);
-		
+
 		pokemon.fainted = true;
 		pokemon.faintQueued = true;
 		pokemon.hp = 0;
 		pokemon.isActive = false;
 		pokemon.status = 'fnt' as any;
 		battleSide.pokemonLeft--;
-		
+
 		// Clear from active slot
 		battleSide.active[position] = null as any;
 
@@ -757,7 +976,7 @@ export class MultiBattleManager {
 	): TransferResult {
 		console.log(`[Timeline Team] receivePokemon("${battleId}", "${side}", switchIn=${switchIn})`);
 		console.log(`[Timeline Team]   Receiving: ${state.set.name || state.set.species} with HP ${state.hp}/${state.maxhp}`);
-		
+
 		const battle = this.getBattle(battleId);
 		if (!battle) {
 			console.log(`[Timeline Team] receivePokemon FAILED: Battle not found`);
@@ -779,7 +998,7 @@ export class MultiBattleManager {
 		// Ensure the set is complete
 		const completeSet = ensureCompletePokemonSet(state.set);
 		console.log(`[Timeline Team] Complete set: ${completeSet.name} (${completeSet.species}), moves: [${completeSet.moves?.join(', ')}]`);
-		
+
 		// Use Side.addPokemon to create the Pokemon properly
 		const pokemon = battleSide.addPokemon(completeSet);
 		if (!pokemon) {
@@ -794,7 +1013,7 @@ export class MultiBattleManager {
 
 		// Log the arrival
 		battle.add('', `${pokemon.name} was transferred into the battle!`);
-		
+
 		const hpPercent = pokemon.maxhp > 0 ? Math.round((pokemon.hp / pokemon.maxhp) * 100) : 0;
 		battle.add('-message', `${pokemon.name} arrived with ${hpPercent}% HP!`);
 
@@ -836,7 +1055,7 @@ export class MultiBattleManager {
 	 */
 	getPokemonTransferState(battleId: string, side: 'p1' | 'p2', position: number = 0): PokemonTransferState | null {
 		console.log(`[Timeline Team] getPokemonTransferState("${battleId}", "${side}", ${position})`);
-		
+
 		const battle = this.getBattle(battleId);
 		if (!battle) {
 			console.log(`[Timeline Team] getPokemonTransferState: Battle not found`);
@@ -900,7 +1119,7 @@ export class MultiBattleManager {
 	 */
 	forceSwitch(battleId: string, side: 'p1' | 'p2', benchPosition: number): boolean {
 		console.log(`[Timeline Team] forceSwitch("${battleId}", "${side}", ${benchPosition})`);
-		
+
 		const battle = this.getBattle(battleId);
 		if (!battle) {
 			console.log(`[Timeline Team] forceSwitch FAILED: Battle not found`);
@@ -933,12 +1152,12 @@ export class MultiBattleManager {
 	}
 
 	/**
-	 * Gets a snapshot of the battle field conditions
+	 * Builds a snapshot of the battle's field conditions.
 	 */
 	private getFieldSnapshot(battle: Battle): FieldSnapshot {
 		const field = battle.field;
 		console.log(`[Timeline Field] Capturing field snapshot - weather: ${field.weather || 'none'}, terrain: ${field.terrain || 'none'}`);
-		
+
 		let weatherSnapshot: FieldConditionSnapshot | null = null;
 		if (field.weather) {
 			const turnsLeft = field.weatherState.duration;
@@ -947,6 +1166,7 @@ export class MultiBattleManager {
 				id: field.weather,
 				turnsLeft: turnsLeft !== undefined ? turnsLeft : undefined,
 				source: source,
+				sourceSlot: field.weatherState.sourceSlot,
 			};
 			console.log(`[Timeline Field]   Weather: ${field.weather}, turnsLeft: ${turnsLeft ?? 'infinite'}, source: ${source || 'unknown'}`);
 		}
@@ -959,6 +1179,7 @@ export class MultiBattleManager {
 				id: field.terrain,
 				turnsLeft: turnsLeft !== undefined ? turnsLeft : undefined,
 				source: source,
+				sourceSlot: field.terrainState.sourceSlot,
 			};
 			console.log(`[Timeline Field]   Terrain: ${field.terrain}, turnsLeft: ${turnsLeft ?? 'infinite'}, source: ${source || 'unknown'}`);
 		}
@@ -970,6 +1191,7 @@ export class MultiBattleManager {
 				id: id,
 				turnsLeft: state.duration !== undefined ? state.duration : undefined,
 				source: state.source?.name,
+				sourceSlot: state.sourceSlot,
 			};
 			pseudoWeatherSnapshots.push(snapshot);
 			console.log(`[Timeline Field]   PseudoWeather: ${id}, turnsLeft: ${state.duration ?? 'infinite'}, source: ${state.source?.name || 'unknown'}`);
@@ -987,13 +1209,13 @@ export class MultiBattleManager {
 	}
 
 	/**
-	 * Gets a snapshot of side conditions for a given side
+	 * Builds a snapshot of one side's side conditions.
 	 */
 	private getSideConditionsSnapshot(side: Side): SideConditionSnapshot[] {
 		const conditions: SideConditionSnapshot[] = [];
-		
+
 		console.log(`[Timeline Side] Capturing side conditions for ${side.id}`);
-		
+
 		for (const id in side.sideConditions) {
 			const state = side.sideConditions[id];
 			const snapshot: SideConditionSnapshot = {
@@ -1001,6 +1223,7 @@ export class MultiBattleManager {
 				turnsLeft: state.duration !== undefined ? state.duration : undefined,
 				layers: state.layers !== undefined ? state.layers : undefined,
 				source: state.source?.name,
+				sourceSlot: state.sourceSlot,
 			};
 			conditions.push(snapshot);
 			console.log(`[Timeline Side]   ${side.id} condition: ${id}, turnsLeft: ${state.duration ?? 'N/A'}, layers: ${state.layers ?? 'N/A'}, source: ${state.source?.name || 'unknown'}`);
@@ -1014,13 +1237,13 @@ export class MultiBattleManager {
 	}
 
 	/**
-	 * Gets a snapshot of slot conditions for a given side
+	 * Builds a snapshot of one side's slot conditions.
 	 */
 	private getSlotConditionsSnapshot(side: Side): { [slot: number]: SlotConditionSnapshot[] } {
 		const slotConditions: { [slot: number]: SlotConditionSnapshot[] } = {};
-		
-		console.log(`[Timeline Side] Capturing slot conditions for ${side.id}`);
-		
+
+		console.log(`[Timeline Slot] Capturing slot conditions for ${side.id}`);
+
 		if (side.slotConditions) {
 			for (let slot = 0; slot < side.slotConditions.length; slot++) {
 				const slotConds = side.slotConditions[slot];
@@ -1033,16 +1256,17 @@ export class MultiBattleManager {
 						id: id,
 						turnsLeft: state.duration !== undefined ? state.duration : undefined,
 						source: state.source?.name,
+						sourceSlot: state.sourceSlot,
 					};
 					slotConditions[slot].push(snapshot);
-					console.log(`[Timeline Side]   ${side.id} slot ${slot} condition: ${id}, turnsLeft: ${state.duration ?? 'N/A'}, source: ${state.source?.name || 'unknown'}`);
+					console.log(`[Timeline Slot]   ${side.id} slot ${slot} condition: ${id}, turnsLeft: ${state.duration ?? 'N/A'}, source: ${state.source?.name || 'unknown'}`);
 				}
 			}
 		}
 
 		const totalSlotConditions = Object.values(slotConditions).reduce((sum, arr) => sum + arr.length, 0);
 		if (totalSlotConditions === 0) {
-			console.log(`[Timeline Side]   ${side.id} has no slot conditions`);
+			console.log(`[Timeline Slot]   ${side.id} has no slot conditions`);
 		}
 
 		return slotConditions;
@@ -1053,7 +1277,7 @@ export class MultiBattleManager {
 	 */
 	getSnapshot(battleId: string): BattleSnapshot | null {
 		console.log(`[Timeline Team] getSnapshot("${battleId}")`);
-		
+
 		const battle = this.getBattle(battleId);
 		if (!battle) {
 			console.log(`[Timeline Team] getSnapshot: Battle not found`);
@@ -1064,12 +1288,12 @@ export class MultiBattleManager {
 			const teamSnapshot = side.pokemon
 				.map(p => this.getPokemonSnapshot(p))
 				.filter((p): p is PokemonSnapshot => p !== null);
-			
+
 			const sideConditions = this.getSideConditionsSnapshot(side);
 			const slotConditions = this.getSlotConditionsSnapshot(side);
-			
+
 			console.log(`[Timeline Team] getSnapshot side ${side.id}: ${teamSnapshot.length} Pokemon, ${side.pokemonLeft} left, ${sideConditions.length} side conditions`);
-			
+
 			return {
 				name: side.name,
 				pokemonLeft: side.pokemonLeft,
@@ -1137,7 +1361,7 @@ export class MultiBattleManager {
 	 */
 	getPokemon(battleId: string, side: 'p1' | 'p2', position: number): Pokemon | null {
 		console.log(`[Timeline Team] getPokemon("${battleId}", "${side}", ${position})`);
-		
+
 		const battle = this.getBattle(battleId);
 		if (!battle) return null;
 
@@ -1154,7 +1378,7 @@ export class MultiBattleManager {
 	 */
 	getActivePokemon(battleId: string, side: 'p1' | 'p2', slot: number = 0): Pokemon | null {
 		console.log(`[Timeline Team] getActivePokemon("${battleId}", "${side}", ${slot})`);
-		
+
 		const battle = this.getBattle(battleId);
 		if (!battle) return null;
 
@@ -1169,7 +1393,12 @@ export class MultiBattleManager {
 	/**
 	 * Replaces a side's team with a stored team snapshot from a timeline node,
 	 * then adds the transferred Pokemon as the new active Pokemon.
-	 * 
+	 *
+	 * The transferred Pokemon is a genuine new arrival to this battle state,
+	 * so battle.actions.switchIn is used and entry hazards / on-entry abilities
+	 * trigger normally. Callers must restore side conditions BEFORE calling
+	 * this so those hazards reflect the target turn.
+	 *
 	 * NOTE: This method does NOT call makeRequest() or sendUpdates().
 	 * The caller (MultiTimeBattleStream) is responsible for triggering
 	 * new requests and flushing updates after all transfers are complete.
@@ -1218,7 +1447,8 @@ export class MultiBattleManager {
 		battleSide.pokemonLeft = 0;
 
 		// ── STEP 3: Reset slotConditions for all active slots ──
-		// This prevents the revivalblessing crash in getSwitchRequestData
+		// Slot conditions are restored separately AFTER this method returns
+		// (they don't affect switchIn, and this rebuild would wipe them).
 		battleSide.slotConditions = [];
 		for (let i = 0; i < battleSide.active.length; i++) {
 			battleSide.slotConditions[i] = {};
@@ -1258,7 +1488,6 @@ export class MultiBattleManager {
 					console.log(`[Timeline Team]   ${pokemon.name} - fainted (from snapshot)`);
 				} else {
 					pokemon.hp = Math.max(1, Math.round((display.hp / 100) * pokemon.maxhp));
-					// ── FIX: silent status on bench mons (they won't even be switched in) ──
 					if (display.status) {
 						this.setStatusSilently(pokemon, display.status, battle);
 					}
@@ -1270,8 +1499,9 @@ export class MultiBattleManager {
 		}
 
 		// ── STEP 6: Switch in the transferred Pokemon (position 0) ──
-		// The transferred Pokemon is at index 0 in the pokemon array.
-		// We need to properly set it as the active Pokemon.
+		// Full switchIn path: entry hazards, Intimidate, weather abilities
+		// all fire. Side conditions must have been restored by the caller
+		// beforehand for hazards to be correct.
 		try {
 			battle.actions.switchIn(transferredPokemon, 0);
 			console.log(`[Timeline Team] Switched in ${transferredPokemon.name} via battle.actions.switchIn`);
@@ -1285,9 +1515,6 @@ export class MultiBattleManager {
 		}
 
 		// ── STEP 7: Verify positions are correct ──
-		// addPokemon sets position = pokemon.length at time of add.
-		// Position 0 = transferred mon (active), positions 1+ = bench.
-		// Make sure active[0] is set correctly.
 		if (!battleSide.active[0] || battleSide.active[0].fainted) {
 			console.log(`[Timeline Team] Active slot still empty after switchIn, forcing manually`);
 			battleSide.active[0] = transferredPokemon;
@@ -1296,7 +1523,6 @@ export class MultiBattleManager {
 		}
 
 		// Ensure slotConditions has entries for all active positions
-		// (should already be done in step 3 but double-check)
 		for (let i = 0; i < battleSide.active.length; i++) {
 			if (!battleSide.slotConditions[i]) {
 				battleSide.slotConditions[i] = {};
@@ -1331,8 +1557,15 @@ export class MultiBattleManager {
 
 	/**
 	 * Restores a side's team to a snapshot state WITHOUT adding a transferred Pokemon.
-	 * Used for the non-transferring side when a branch is created.
-	 * This ensures both sides reflect the target turn's state.
+	 * Used for the non-transferring side when a branch is created, and for both
+	 * sides during a present-shift.
+	 *
+	 * The active Pokemon in the snapshot was already present at the target turn —
+	 * its HP already reflects any entry hazard damage, and any Intimidate / weather
+	 * ability effects are already baked into the snapshot data. Running it through
+	 * battle.actions.switchIn would double-apply those effects. Instead this
+	 * method uses direct active-slot assignment and emits a raw |switch| protocol
+	 * line so the client stays in sync.
 	 */
 	restoreTeamFromSnapshot(
 		battleId: string,
@@ -1377,6 +1610,7 @@ export class MultiBattleManager {
 		battleSide.pokemonLeft = 0;
 
 		// ── STEP 3: Reset slotConditions ──
+		// Slot conditions are restored separately AFTER this method returns.
 		battleSide.slotConditions = [];
 		for (let i = 0; i < battleSide.active.length; i++) {
 			battleSide.slotConditions[i] = {};
@@ -1410,14 +1644,14 @@ export class MultiBattleManager {
 					// Apply HP (stored as percentage)
 					pokemon.hp = Math.max(1, Math.round((display.hp / 100) * pokemon.maxhp));
 
-					// ── FIX: silent status — no protocol until switchIn sends |switch| ──
+					// Silent status: no events, no protocol before |switch|
 					if (display.status && display.status !== '') {
 						this.setStatusSilently(pokemon, display.status, battle);
 					}
 
 					console.log(`[Timeline Team]   ${pokemon.name} HP: ${pokemon.hp}/${pokemon.maxhp} (${display.hp}%), status: ${display.status || 'none'}`);
 
-					// Track if this is the active Pokemon - we'll apply boosts after switch-in
+					// Track if this is the active Pokemon - we'll apply boosts after placement
 					if (display.isActive) {
 						activePokemon = pokemon;
 						activeDisplayData = display;
@@ -1428,76 +1662,86 @@ export class MultiBattleManager {
 			}
 		}
 
-		// ── STEP 5: Switch in the active Pokemon ──
-		if (activePokemon && !activePokemon.fainted) {
-			try {
-				battle.actions.switchIn(activePokemon, 0);
-				console.log(`[Timeline Team] Switched in ${activePokemon.name} as active`);
-			} catch (e: any) {
-				console.log(`[Timeline Team] switchIn threw: ${e.message}, using manual fallback`);
-				battleSide.active[0] = activePokemon;
-				activePokemon.isActive = true;
-				activePokemon.activeTurns = 0;
-				activePokemon.activeMoveActions = 0;
-				activePokemon.position = 0;
+		// ── STEP 5: Place the active Pokemon directly (no switchIn events) ──
+		// This Pokemon was ALREADY active at the target turn. Its snapshot HP
+		// already accounts for any Stealth Rock damage it took on its original
+		// entry. Running switchIn would re-trigger hazards and re-fire abilities
+		// like Intimidate whose results are already in the snapshot.
+		const placeMon = activePokemon ?? battleSide.pokemon.find(p => !p.fainted && p.hp > 0) ?? null;
+
+		if (placeMon) {
+			// Swap into index 0 so position matches active slot (singles assumption)
+			const currentIdx = battleSide.pokemon.indexOf(placeMon);
+			if (currentIdx > 0) {
+				const swapWith = battleSide.pokemon[0];
+				battleSide.pokemon[0] = placeMon;
+				battleSide.pokemon[currentIdx] = swapWith;
+				placeMon.position = 0;
+				if (swapWith) swapWith.position = currentIdx;
+				console.log(`[Timeline Team]   Swapped ${placeMon.name} to index 0 (was ${currentIdx})`);
 			}
 
-			// ── STEP 6: Apply boosts and volatiles to the active Pokemon ──
-			// This must happen AFTER switch-in since switching clears boosts
-			if (activeDisplayData) {
-				// Apply stat boosts
-				if (activeDisplayData.boosts) {
-					const boostKeys = ['atk', 'def', 'spa', 'spd', 'spe', 'accuracy', 'evasion'] as const;
-					for (const stat of boostKeys) {
-						const boost = activeDisplayData.boosts[stat];
-						if (boost !== undefined && boost !== 0) {
-							activePokemon.boosts[stat] = boost;
-						}
-					}
-					console.log(`[Timeline Team]   Applied boosts: ${JSON.stringify(activeDisplayData.boosts)}`);
-				}
+			battleSide.active[0] = placeMon;
+			placeMon.isActive = true;
+			placeMon.activeTurns = 0;
+			placeMon.activeMoveActions = 0;
 
-				// Apply volatiles (only safe ones that can be restored as flags)
-				if (activeDisplayData.volatiles && activeDisplayData.volatiles.length > 0) {
-					const safeVolatiles = new Set([
-						'substitute', 'confusion', 'leechseed', 'curse',
-						'embargo', 'healblock', 'partiallytrapped',
-						'taunt', 'torment', 'encore', 'disable', 'attract',
-						'focusenergy', 'magnetrise', 'aquaring', 'ingrain',
-						'flashfire', 'slowstart', 'truant', 'unburden',
-						'charge', 'defensecurl', 'lockon', 'minimize',
-						'stockpile', 'stockpile1', 'stockpile2', 'stockpile3',
-					]);
-
-					const appliedVolatiles: string[] = [];
-					for (const vol of activeDisplayData.volatiles) {
-						if (safeVolatiles.has(vol)) {
-							activePokemon.volatiles[vol] = {
-								id: vol as ID,
-								target: activePokemon,
-								effectOrder: 0,
-							};
-							appliedVolatiles.push(vol);
-						}
-					}
-					if (appliedVolatiles.length > 0) {
-						console.log(`[Timeline Team]   Applied volatiles: [${appliedVolatiles.join(', ')}]`);
-					}
-				}
+			// Emit a |switch| line so the client can place the sprite and HP bar.
+			// Protocol format: |switch|POKEMON|DETAILS|HP STATUS
+			try {
+				const details = (placeMon as any).details || `${placeMon.species.name}, L${placeMon.level}`;
+				const healthStr = placeMon.fainted
+					? '0 fnt'
+					: `${placeMon.hp}/${placeMon.maxhp}${placeMon.status ? ` ${placeMon.status}` : ''}`;
+				battle.add('switch', placeMon, details, healthStr);
+				console.log(`[Timeline Team]   Emitted |switch| for ${placeMon.name}: ${healthStr}`);
+			} catch (e: any) {
+				console.log(`[Timeline Team]   Failed to emit |switch| for ${placeMon.name}: ${e.message}`);
 			}
 		} else {
-			// Find any non-fainted Pokemon to make active
-			const available = battleSide.pokemon.find(p => !p.fainted && p.hp > 0);
-			if (available) {
-				try {
-					battle.actions.switchIn(available, 0);
-					console.log(`[Timeline Team] Switched in ${available.name} as fallback active`);
-				} catch (e: any) {
-					battleSide.active[0] = available;
-					available.isActive = true;
+			console.log(`[Timeline Team]   No Pokemon available to place as active for ${side}`);
+		}
+
+		// ── STEP 6: Apply boosts and volatiles to the placed Pokemon ──
+		// These are applied after placement because a real switchIn would have
+		// cleared them; here we're restoring a snapshot where they were present.
+		if (placeMon && activeDisplayData) {
+			if (activeDisplayData.boosts) {
+				const boostKeys = ['atk', 'def', 'spa', 'spd', 'spe', 'accuracy', 'evasion'] as const;
+				for (const stat of boostKeys) {
+					const boost = activeDisplayData.boosts[stat];
+					if (boost !== undefined && boost !== 0) {
+						placeMon.boosts[stat] = boost;
+					}
 				}
-			} else {
-				console.log(`[Timeline Team] No Pokemon available to switch in for ${side}`);
+				console.log(`[Timeline Team]   Applied boosts: ${JSON.stringify(activeDisplayData.boosts)}`);
+			}
+
+			if (activeDisplayData.volatiles && activeDisplayData.volatiles.length > 0) {
+				const safeVolatiles = new Set([
+					'substitute', 'confusion', 'leechseed', 'curse',
+					'embargo', 'healblock', 'partiallytrapped',
+					'taunt', 'torment', 'encore', 'disable', 'attract',
+					'focusenergy', 'magnetrise', 'aquaring', 'ingrain',
+					'flashfire', 'slowstart', 'truant', 'unburden',
+					'charge', 'defensecurl', 'lockon', 'minimize',
+					'stockpile', 'stockpile1', 'stockpile2', 'stockpile3',
+				]);
+
+				const appliedVolatiles: string[] = [];
+				for (const vol of activeDisplayData.volatiles) {
+					if (safeVolatiles.has(vol)) {
+						placeMon.volatiles[vol] = {
+							id: vol as any,
+							target: placeMon,
+							effectOrder: 0,
+						};
+						appliedVolatiles.push(vol);
+					}
+				}
+				if (appliedVolatiles.length > 0) {
+					console.log(`[Timeline Team]   Applied volatiles: [${appliedVolatiles.join(', ')}]`);
+				}
 			}
 		}
 
@@ -1567,7 +1811,7 @@ export class MultiBattleManager {
 	 */
 	destroyBattle(battleId: string): void {
 		console.log(`[Timeline Team] destroyBattle("${battleId}")`);
-		
+
 		const battle = this.getBattle(battleId);
 		if (battle) {
 			battle.destroy();

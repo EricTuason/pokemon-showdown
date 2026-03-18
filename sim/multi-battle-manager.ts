@@ -103,6 +103,13 @@ export interface FieldConditionSnapshot {
 	turnsLeft?: number;
 	source?: string;      // Pokemon name, not a reference
 	sourceSlot?: string;  // e.g. "p1a"
+	/**
+	 * Condition-specific EffectState fields beyond the standard set.
+	 * Most field conditions don't need this, but it keeps the schema
+	 * uniform with side/slot conditions. Captured as JSON-safe values;
+	 * game-object references are stripped at capture time.
+	 */
+	extraData?: { [key: string]: any };
 }
 
 /**
@@ -123,6 +130,8 @@ export interface SideConditionSnapshot {
 	layers?: number;      // For stackable conditions (Spikes, Toxic Spikes)
 	source?: string;      // Pokemon name
 	sourceSlot?: string;
+	/** See FieldConditionSnapshot.extraData. */
+	extraData?: { [key: string]: any };
 }
 
 /**
@@ -133,7 +142,15 @@ export interface SlotConditionSnapshot {
 	turnsLeft?: number;
 	source?: string;
 	sourceSlot?: string;
+	/**
+	 * See FieldConditionSnapshot.extraData. Slot conditions are the main
+	 * reason this field exists — Future Sight stores `move`/`moveData`,
+	 * Wish stores `hp`, and those MUST survive restoration or the
+	 * condition resolves into nothing when its countdown hits zero.
+	 */
+	extraData?: { [key: string]: any };
 }
+
 
 export interface BattleSnapshot {
 	battleId: string;
@@ -700,72 +717,133 @@ export class MultiBattleManager {
 
 	/**
 	 * Replaces the battle's field state (weather, terrain, pseudo-weather)
-	 * with a snapshot, without firing onFieldStart/onFieldEnd events or
-	 * emitting |-weather| / |-fieldstart| protocol lines.
+	 * with a snapshot.
+	 *
+	 * Engine events (onFieldStart/onFieldEnd/WeatherChange) are NOT fired —
+	 * those would re-run duration callbacks and re-trigger ability
+	 * interactions whose results are already baked into the snapshot.
+	 *
+	 * Protocol lines (|-weather|, |-fieldstart|, |-fieldend|) ARE emitted
+	 * so the client's weather icon / terrain overlay updates to match.
+	 * Emission is diffed against the prior state so unchanged weather
+	 * doesn't produce spurious log lines.
+	 *
+	 * The `source` reference on each EffectState is left null here because
+	 * this method runs BEFORE team rebuild (it has to — hazards need to be
+	 * in place when switchIn fires). Call reconnectConditionSources() after
+	 * teams are restored to patch the references against the rebuilt roster.
 	 *
 	 * Passing null clears the field entirely. Call this ONCE per restore
 	 * operation (field is battle-scoped, not side-scoped).
 	 */
-	restoreFieldSilently(battleId: string, snapshot: FieldSnapshot | null): boolean {
+	restoreField(battleId: string, snapshot: FieldSnapshot | null): boolean {
 		const battle = this.getBattle(battleId);
 		if (!battle) {
-			console.log(`[Timeline Restore] restoreFieldSilently: battle "${battleId}" not found`);
+			console.log(`[Timeline Restore] restoreField: battle "${battleId}" not found`);
 			return false;
 		}
 
 		const field = battle.field;
-		console.log(`[Timeline Restore] restoreFieldSilently("${battleId}")`);
+		const condName = (id: string) => battle.dex.conditions.getByID(id as any)?.name || id;
+
+		console.log(`[Timeline Restore] restoreField("${battleId}")`);
 		console.log(`[Timeline Restore]   Before: weather=${field.weather || 'none'}, terrain=${field.terrain || 'none'}, pseudoWeather=[${Object.keys(field.pseudoWeather).join(', ')}]`);
 
-		// ── Clear everything first ──
+		const oldWeather = field.weather;
+		const oldTerrain = field.terrain;
+		const oldPseudo = new Set(Object.keys(field.pseudoWeather));
+
+		const newWeather = snapshot?.weather?.id || '';
+		const newTerrain = snapshot?.terrain?.id || '';
+		const newPseudo = new Set((snapshot?.pseudoWeather || []).map(pw => pw.id).filter(Boolean));
+
+		// ── Clear pseudo-weather in-place ──
+		// Key deletion preserves the object reference in case anything
+		// else holds a pointer to field.pseudoWeather.
+		for (const id of oldPseudo) {
+			if (!newPseudo.has(id)) {
+				battle.add('-fieldend', 'move: ' + condName(id));
+			}
+			delete field.pseudoWeather[id];
+		}
+
+		// ── Clear weather/terrain state ──
 		field.weather = '' as any;
 		field.weatherState = battle.initEffectState({ id: '' });
 		field.terrain = '' as any;
 		field.terrainState = battle.initEffectState({ id: '' });
-		field.pseudoWeather = {};
 
 		if (!snapshot) {
+			if (oldWeather) battle.add('-weather', 'none');
+			if (oldTerrain) battle.add('-fieldend', 'move: ' + condName(oldTerrain));
 			console.log(`[Timeline Restore]   Null snapshot: field cleared`);
 			return true;
 		}
 
 		// ── Weather ──
+		// source is left null; reconnectConditionSources patches it post-rebuild
 		if (snapshot.weather && snapshot.weather.id) {
-			const src = this.findPokemonByName(battle, snapshot.weather.source);
 			field.weather = snapshot.weather.id as any;
 			field.weatherState = battle.initEffectState({
 				id: snapshot.weather.id as any,
-				source: src,
+				source: null,
 				sourceSlot: snapshot.weather.sourceSlot,
 				duration: snapshot.weather.turnsLeft,
 			});
-			console.log(`[Timeline Restore]   Weather restored: ${snapshot.weather.id}, duration=${snapshot.weather.turnsLeft ?? 'infinite'}, source=${src?.name || `null(was "${snapshot.weather.source}")`}`);
+			if (snapshot.weather.extraData) {
+				for (const key in snapshot.weather.extraData) {
+					field.weatherState[key] = snapshot.weather.extraData[key];
+				}
+			}
+			if (oldWeather !== snapshot.weather.id) {
+				battle.add('-weather', condName(snapshot.weather.id));
+			}
+			console.log(`[Timeline Restore]   Weather restored: ${snapshot.weather.id}, duration=${snapshot.weather.turnsLeft ?? 'infinite'} (source deferred)`);
+		} else if (oldWeather) {
+			battle.add('-weather', 'none');
 		}
 
 		// ── Terrain ──
 		if (snapshot.terrain && snapshot.terrain.id) {
-			const src = this.findPokemonByName(battle, snapshot.terrain.source);
 			field.terrain = snapshot.terrain.id as any;
 			field.terrainState = battle.initEffectState({
 				id: snapshot.terrain.id as any,
-				source: src,
+				source: null,
 				sourceSlot: snapshot.terrain.sourceSlot,
 				duration: snapshot.terrain.turnsLeft,
 			});
-			console.log(`[Timeline Restore]   Terrain restored: ${snapshot.terrain.id}, duration=${snapshot.terrain.turnsLeft ?? 'infinite'}, source=${src?.name || `null(was "${snapshot.terrain.source}")`}`);
+			if (snapshot.terrain.extraData) {
+				for (const key in snapshot.terrain.extraData) {
+					field.terrainState[key] = snapshot.terrain.extraData[key];
+				}
+			}
+			if (oldTerrain !== snapshot.terrain.id) {
+				battle.add('-fieldstart', 'move: ' + condName(snapshot.terrain.id));
+			}
+			console.log(`[Timeline Restore]   Terrain restored: ${snapshot.terrain.id}, duration=${snapshot.terrain.turnsLeft ?? 'infinite'} (source deferred)`);
+		} else if (oldTerrain) {
+			battle.add('-fieldend', 'move: ' + condName(oldTerrain));
 		}
 
 		// ── Pseudo-weather ──
 		for (const pw of snapshot.pseudoWeather) {
 			if (!pw.id) continue;
-			const src = this.findPokemonByName(battle, pw.source);
-			field.pseudoWeather[pw.id] = battle.initEffectState({
+			const state = battle.initEffectState({
 				id: pw.id as any,
-				source: src,
+				source: null,
 				sourceSlot: pw.sourceSlot,
 				duration: pw.turnsLeft,
 			});
-			console.log(`[Timeline Restore]   PseudoWeather restored: ${pw.id}, duration=${pw.turnsLeft ?? 'infinite'}, source=${src?.name || `null(was "${pw.source}")`}`);
+			if (pw.extraData) {
+				for (const key in pw.extraData) {
+					state[key] = pw.extraData[key];
+				}
+			}
+			field.pseudoWeather[pw.id] = state;
+			if (!oldPseudo.has(pw.id)) {
+				battle.add('-fieldstart', 'move: ' + condName(pw.id));
+			}
+			console.log(`[Timeline Restore]   PseudoWeather restored: ${pw.id}, duration=${pw.turnsLeft ?? 'infinite'} (source deferred)`);
 		}
 
 		console.log(`[Timeline Restore]   After: weather=${field.weather || 'none'}, terrain=${field.terrain || 'none'}, pseudoWeather=[${Object.keys(field.pseudoWeather).join(', ')}]`);
@@ -773,36 +851,60 @@ export class MultiBattleManager {
 	}
 
 	/**
-	 * Replaces one side's sideConditions dict with a snapshot, without
-	 * firing onSideStart/onSideEnd events or emitting |-sidestart| /
-	 * |-sideend| protocol lines.
+	 * Replaces one side's sideConditions with a snapshot.
 	 *
-	 * Passing null or an empty array clears all side conditions. Stale
-	 * conditions are always cleared before the snapshot is applied.
+	 * Engine events (onSideStart/onSideEnd/SideConditionStart) are NOT
+	 * fired — we don't want to re-run setup logic whose results are
+	 * already in the snapshot.
+	 *
+	 * Protocol lines (|-sidestart|, |-sideend|) ARE emitted so the client's
+	 * hazard/screen display updates. Emission is diffed against the prior
+	 * state, so a Stealth Rock that was already up doesn't produce a
+	 * redundant "pointed stones" message.
+	 *
+	 * Stale conditions are cleared by key deletion rather than object
+	 * replacement, so that ally-side shared references in multi-battle
+	 * formats stay valid (see Side.sideConditions comment).
+	 *
+	 * `source` references are left null; call reconnectConditionSources()
+	 * after team rebuild. Passing null or an empty array clears all
+	 * side conditions for this side.
 	 */
-	restoreSideConditionsSilently(
+	restoreSideConditions(
 		battleId: string,
 		sideId: 'p1' | 'p2',
 		conditions: SideConditionSnapshot[] | null
 	): boolean {
 		const battle = this.getBattle(battleId);
 		if (!battle) {
-			console.log(`[Timeline Restore] restoreSideConditionsSilently: battle "${battleId}" not found`);
+			console.log(`[Timeline Restore] restoreSideConditions: battle "${battleId}" not found`);
 			return false;
 		}
 
 		const side = battle[sideId];
 		if (!side) {
-			console.log(`[Timeline Restore] restoreSideConditionsSilently: side "${sideId}" not found`);
+			console.log(`[Timeline Restore] restoreSideConditions: side "${sideId}" not found`);
 			return false;
 		}
 
+		const condName = (id: string) => battle.dex.conditions.getByID(id as any)?.name || id;
+
 		const before = Object.keys(side.sideConditions);
-		console.log(`[Timeline Restore] restoreSideConditionsSilently("${battleId}", "${sideId}")`);
+		const beforeSet = new Set(before);
+		const afterSet = new Set((conditions || []).map(c => c.id).filter(Boolean));
+
+		console.log(`[Timeline Restore] restoreSideConditions("${battleId}", "${sideId}")`);
 		console.log(`[Timeline Restore]   Before: [${before.join(', ')}]`);
 
-		// ── Clear all stale conditions ──
-		side.sideConditions = {};
+		// ── Clear in-place so ally-side shared refs stay valid ──
+		// Emit -sideend only for conditions that aren't coming back,
+		// to avoid a redundant remove/add flash for unchanged hazards.
+		for (const id of before) {
+			if (!afterSet.has(id)) {
+				battle.add('-sideend', side, 'move: ' + condName(id));
+			}
+			delete side.sideConditions[id];
+		}
 
 		if (!conditions || conditions.length === 0) {
 			console.log(`[Timeline Restore]   Empty snapshot: side conditions cleared`);
@@ -810,25 +912,33 @@ export class MultiBattleManager {
 		}
 
 		// ── Rebuild from snapshot ──
+		// source left null; reconnectConditionSources patches it post-rebuild
 		for (const cond of conditions) {
 			if (!cond.id) continue;
-			const src = this.findPokemonByName(battle, cond.source);
 
 			const state = battle.initEffectState({
 				id: cond.id as any,
 				target: side,
-				source: src,
+				source: null,
 				sourceSlot: cond.sourceSlot,
 				duration: cond.turnsLeft,
 			});
 
-			// layers lives directly on the EffectState for stackable conditions
 			if (cond.layers !== undefined) {
 				state.layers = cond.layers;
 			}
+			if (cond.extraData) {
+				for (const key in cond.extraData) {
+					state[key] = cond.extraData[key];
+				}
+			}
 
 			side.sideConditions[cond.id] = state;
-			console.log(`[Timeline Restore]   Restored ${cond.id}: duration=${cond.turnsLeft ?? 'N/A'}, layers=${cond.layers ?? 'N/A'}, source=${src?.name || `null(was "${cond.source}")`}`);
+
+			if (!beforeSet.has(cond.id)) {
+				battle.add('-sidestart', side, 'move: ' + condName(cond.id));
+			}
+			console.log(`[Timeline Restore]   Restored ${cond.id}: duration=${cond.turnsLeft ?? 'N/A'}, layers=${cond.layers ?? 'N/A'}, extraKeys=[${Object.keys(cond.extraData || {}).join(', ')}] (source deferred)`);
 		}
 
 		console.log(`[Timeline Restore]   After: [${Object.keys(side.sideConditions).join(', ')}]`);
@@ -837,29 +947,37 @@ export class MultiBattleManager {
 
 	/**
 	 * Replaces one side's slotConditions with a snapshot, without firing
-	 * events. Call this AFTER replaceTeamFromSnapshot / restoreTeamFromSnapshot,
+	 * onStart/onEnd events.
+	 *
+	 * Slot conditions (Wish, Future Sight, Healing Wish, Doom Desire)
+	 * don't have a standard "condition active" protocol line — they only
+	 * announce themselves when they resolve. No protocol emission here.
+	 *
+	 * Call this AFTER replaceTeamFromSnapshot / restoreTeamFromSnapshot,
 	 * since those methods reset slotConditions to empty during team rebuild.
+	 * Because this runs post-rebuild, `source` lookup works correctly here
+	 * without needing a separate reconnect pass.
 	 *
 	 * Passing null or an empty object leaves the slots cleared.
 	 */
-	restoreSlotConditionsSilently(
+	restoreSlotConditions(
 		battleId: string,
 		sideId: 'p1' | 'p2',
 		slotConditions: { [slot: number]: SlotConditionSnapshot[] } | null
 	): boolean {
 		const battle = this.getBattle(battleId);
 		if (!battle) {
-			console.log(`[Timeline Restore] restoreSlotConditionsSilently: battle "${battleId}" not found`);
+			console.log(`[Timeline Restore] restoreSlotConditions: battle "${battleId}" not found`);
 			return false;
 		}
 
 		const side = battle[sideId];
 		if (!side) {
-			console.log(`[Timeline Restore] restoreSlotConditionsSilently: side "${sideId}" not found`);
+			console.log(`[Timeline Restore] restoreSlotConditions: side "${sideId}" not found`);
 			return false;
 		}
 
-		console.log(`[Timeline Slot] restoreSlotConditionsSilently("${battleId}", "${sideId}")`);
+		console.log(`[Timeline Slot] restoreSlotConditions("${battleId}", "${sideId}")`);
 
 		// Ensure the slotConditions array is at least as long as active slots
 		if (!side.slotConditions) side.slotConditions = [];
@@ -877,15 +995,15 @@ export class MultiBattleManager {
 			const slot = parseInt(slotStr, 10);
 			if (isNaN(slot)) continue;
 
-			// Ensure the slot exists
 			if (!side.slotConditions[slot]) side.slotConditions[slot] = {};
 
 			const condsForSlot = slotConditions[slot];
 			for (const cond of condsForSlot) {
 				if (!cond.id) continue;
+				// Runs post-rebuild, so this hits the rebuilt roster
 				const src = this.findPokemonByName(battle, cond.source);
 
-				side.slotConditions[slot][cond.id] = battle.initEffectState({
+				const state = battle.initEffectState({
 					id: cond.id as any,
 					target: side,
 					source: src,
@@ -893,13 +1011,106 @@ export class MultiBattleManager {
 					isSlotCondition: true,
 					duration: cond.turnsLeft,
 				});
+				if (cond.extraData) {
+					for (const key in cond.extraData) {
+						state[key] = cond.extraData[key];
+					}
+				}
+
+				side.slotConditions[slot][cond.id] = state;
 				restored++;
-				console.log(`[Timeline Slot]   Restored slot ${slot}: ${cond.id}, duration=${cond.turnsLeft ?? 'N/A'}, source=${src?.name || `null(was "${cond.source}")`}`);
+				console.log(`[Timeline Slot]   Restored slot ${slot}: ${cond.id}, duration=${cond.turnsLeft ?? 'N/A'}, source=${src?.name || `null(was "${cond.source}")`}, extraKeys=[${Object.keys(cond.extraData || {}).join(', ')}]`);
 			}
 		}
 
 		console.log(`[Timeline Slot]   Total restored: ${restored} slot condition(s)`);
 		return true;
+	}
+
+	/**
+	 * Walks the field and side-condition EffectStates and re-resolves their
+	 * `source` references against the CURRENT team roster.
+	 *
+	 * restoreField and restoreSideConditions must run before team rebuild
+	 * (so entry hazards are in place when switchIn fires), which means
+	 * findPokemonByName can't resolve source names at that point — the
+	 * roster is the torn-down / pre-rebuild one. This method runs AFTER
+	 * team rebuild to patch the references.
+	 *
+	 * Source names come from the snapshot passed in, not from the
+	 * EffectState (which was deliberately left with source: null).
+	 *
+	 * Slot conditions don't need this — restoreSlotConditions already runs
+	 * post-rebuild and resolves source correctly on its own.
+	 */
+	reconnectConditionSources(
+		battleId: string,
+		fieldSnap: FieldSnapshot | null,
+		p1SideConds: SideConditionSnapshot[] | null,
+		p2SideConds: SideConditionSnapshot[] | null,
+	): void {
+		const battle = this.getBattle(battleId);
+		if (!battle) return;
+
+		console.log(`[Timeline Restore] reconnectConditionSources("${battleId}")`);
+		let patched = 0;
+
+		// ── Field ──
+		if (fieldSnap) {
+			if (fieldSnap.weather?.source && battle.field.weather) {
+				const src = this.findPokemonByName(battle, fieldSnap.weather.source);
+				if (src) {
+					battle.field.weatherState.source = src;
+					patched++;
+					console.log(`[Timeline Restore]   Weather source → ${src.name}`);
+				} else {
+					console.log(`[Timeline Restore]   Weather source "${fieldSnap.weather.source}" not in rebuilt roster`);
+				}
+			}
+			if (fieldSnap.terrain?.source && battle.field.terrain) {
+				const src = this.findPokemonByName(battle, fieldSnap.terrain.source);
+				if (src) {
+					battle.field.terrainState.source = src;
+					patched++;
+					console.log(`[Timeline Restore]   Terrain source → ${src.name}`);
+				} else {
+					console.log(`[Timeline Restore]   Terrain source "${fieldSnap.terrain.source}" not in rebuilt roster`);
+				}
+			}
+			for (const pw of fieldSnap.pseudoWeather) {
+				if (!pw.source || !battle.field.pseudoWeather[pw.id]) continue;
+				const src = this.findPokemonByName(battle, pw.source);
+				if (src) {
+					battle.field.pseudoWeather[pw.id].source = src;
+					patched++;
+					console.log(`[Timeline Restore]   PseudoWeather ${pw.id} source → ${src.name}`);
+				} else {
+					console.log(`[Timeline Restore]   PseudoWeather ${pw.id} source "${pw.source}" not in rebuilt roster`);
+				}
+			}
+		}
+
+		// ── Side conditions ──
+		const reconnectSide = (sideId: 'p1' | 'p2', conds: SideConditionSnapshot[] | null) => {
+			if (!conds) return;
+			const side = battle[sideId];
+			if (!side) return;
+			for (const cond of conds) {
+				if (!cond.source || !side.sideConditions[cond.id]) continue;
+				const src = this.findPokemonByName(battle, cond.source);
+				if (src) {
+					side.sideConditions[cond.id].source = src;
+					patched++;
+					console.log(`[Timeline Restore]   ${sideId} ${cond.id} source → ${src.name}`);
+				} else {
+					console.log(`[Timeline Restore]   ${sideId} ${cond.id} source "${cond.source}" not in rebuilt roster`);
+				}
+			}
+		};
+		reconnectSide('p1', p1SideConds);
+		reconnectSide('p2', p2SideConds);
+
+		console.log(`[Timeline Restore]   Reconnected ${patched} source reference(s)`);
 	}
 
 	/**

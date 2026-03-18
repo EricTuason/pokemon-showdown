@@ -105,6 +105,69 @@ function extractTeamSnapshot(side: any): PokemonSnapshot[] {
 }
 
 /**
+ * EffectState keys that are either handled explicitly by the snapshot
+ * schema (id, duration, layers, sourceSlot) or hold live game-object
+ * references that can't be serialized (target, source). Everything NOT
+ * in this set is captured into extraData.
+ */
+const EFFECTSTATE_STANDARD_KEYS = new Set([
+	'id', 'target', 'source', 'sourceSlot', 'duration', 'effectOrder',
+	'layers', 'isSlotCondition',
+]);
+
+/**
+ * Captures condition-specific EffectState fields beyond the standard set.
+ *
+ * Some conditions stash extra data in their EffectState during
+ * onSideStart/onFieldStart/onStart that the engine reads later when the
+ * condition resolves. Future Sight stores `move` and `moveData`; Wish
+ * stores `hp`. Without capturing these, a restored Future Sight would
+ * count down correctly but deal zero damage on resolution.
+ *
+ * Game-object references (anything with a .battle / .side back-pointer
+ * or a getSlot method) are skipped — they can't survive serialization
+ * and would be stale after team rebuild anyway. Plain objects are
+ * deep-copied via JSON round-trip, which also catches circular refs.
+ */
+function extractExtraEffectData(state: any): { [key: string]: any } | undefined {
+	if (!state) return undefined;
+	const extra: { [key: string]: any } = {};
+	let hasExtra = false;
+
+	for (const key in state) {
+		if (EFFECTSTATE_STANDARD_KEYS.has(key)) continue;
+		const val = state[key];
+
+		if (val === null || val === undefined) {
+			extra[key] = val;
+			hasExtra = true;
+			continue;
+		}
+
+		if (typeof val === 'function') continue;
+
+		if (typeof val === 'object') {
+			// Skip live game objects — Pokemon, Side, Battle, Field all
+			// carry a .battle or .side pointer, or expose getSlot().
+			if (val.battle || val.side || typeof val.getSlot === 'function') continue;
+			if (Array.isArray(val) && val.length > 0 && (val[0]?.battle || val[0]?.side)) continue;
+			// JSON round-trip: deep copy, drops functions, throws on cycles
+			try {
+				extra[key] = JSON.parse(JSON.stringify(val));
+				hasExtra = true;
+			} catch {
+				// Circular or otherwise unserializable — skip silently
+			}
+		} else {
+			extra[key] = val;
+			hasExtra = true;
+		}
+	}
+
+	return hasExtra ? extra : undefined;
+}
+
+/**
  * Reads weather, terrain, and pseudo-weather from a live battle's field.
  */
 function extractFieldSnapshot(battle: any): FieldSnapshot {
@@ -123,6 +186,7 @@ function extractFieldSnapshot(battle: any): FieldSnapshot {
 			turnsLeft: field.weatherState?.duration,
 			source: field.weatherState?.source?.name,
 			sourceSlot: field.weatherState?.sourceSlot,
+			extraData: extractExtraEffectData(field.weatherState),
 		};
 		console.log(`[Timeline Field]   Weather captured: ${weather.id}, turnsLeft: ${weather.turnsLeft ?? 'infinite'}`);
 	}
@@ -134,6 +198,7 @@ function extractFieldSnapshot(battle: any): FieldSnapshot {
 			turnsLeft: field.terrainState?.duration,
 			source: field.terrainState?.source?.name,
 			sourceSlot: field.terrainState?.sourceSlot,
+			extraData: extractExtraEffectData(field.terrainState),
 		};
 		console.log(`[Timeline Field]   Terrain captured: ${terrain.id}, turnsLeft: ${terrain.turnsLeft ?? 'infinite'}`);
 	}
@@ -147,6 +212,7 @@ function extractFieldSnapshot(battle: any): FieldSnapshot {
 				turnsLeft: state.duration,
 				source: state.source?.name,
 				sourceSlot: state.sourceSlot,
+				extraData: extractExtraEffectData(state),
 			});
 			console.log(`[Timeline Field]   PseudoWeather captured: ${id}, turnsLeft: ${state.duration ?? 'infinite'}`);
 		}
@@ -173,6 +239,7 @@ function extractSideConditions(side: any): SideConditionSnapshot[] {
 			layers: state.layers,
 			source: state.source?.name,
 			sourceSlot: state.sourceSlot,
+			extraData: extractExtraEffectData(state),
 		});
 		console.log(`[Timeline Side]   ${side.id} condition: ${id}, turnsLeft: ${state.duration ?? 'N/A'}, layers: ${state.layers ?? 'N/A'}`);
 	}
@@ -210,6 +277,7 @@ function extractSlotConditions(side: any): { [slot: number]: SlotConditionSnapsh
 				turnsLeft: state.duration,
 				source: state.source?.name,
 				sourceSlot: state.sourceSlot,
+				extraData: extractExtraEffectData(state),
 			});
 			total++;
 			console.log(`[Timeline Slot]   ${side.id} slot ${slot}: ${id}, turnsLeft: ${state.duration ?? 'N/A'}`);
@@ -296,13 +364,26 @@ function deepCloneSet(s: PokemonSet): PokemonSet {
 }
 
 /**
+ * Deep-clones extraData via JSON round-trip. extraData is already
+ * JSON-safe (extractExtraEffectData guarantees that), so this is lossless.
+ */
+function cloneExtraData(extra: { [key: string]: any } | undefined): { [key: string]: any } | undefined {
+	if (!extra) return undefined;
+	return JSON.parse(JSON.stringify(extra));
+}
+
+/**
  * Deep-clones a FieldSnapshot.
  */
 function deepCloneFieldSnapshot(field: FieldSnapshot): FieldSnapshot {
 	return {
-		weather: field.weather ? { ...field.weather } : null,
-		terrain: field.terrain ? { ...field.terrain } : null,
-		pseudoWeather: field.pseudoWeather.map(pw => ({ ...pw })),
+		weather: field.weather
+			? { ...field.weather, extraData: cloneExtraData(field.weather.extraData) }
+			: null,
+		terrain: field.terrain
+			? { ...field.terrain, extraData: cloneExtraData(field.terrain.extraData) }
+			: null,
+		pseudoWeather: field.pseudoWeather.map(pw => ({ ...pw, extraData: cloneExtraData(pw.extraData) })),
 	};
 }
 
@@ -310,7 +391,7 @@ function deepCloneFieldSnapshot(field: FieldSnapshot): FieldSnapshot {
  * Deep-clones an array of SideConditionSnapshots.
  */
 function deepCloneSideConditions(conditions: SideConditionSnapshot[]): SideConditionSnapshot[] {
-	return conditions.map(c => ({ ...c }));
+	return conditions.map(c => ({ ...c, extraData: cloneExtraData(c.extraData) }));
 }
 
 /**
@@ -322,7 +403,7 @@ function deepCloneSlotConditions(
 	const out: { [slot: number]: SlotConditionSnapshot[] } = {};
 	for (const slotStr in slotConds) {
 		const slot = parseInt(slotStr, 10);
-		out[slot] = slotConds[slot].map(c => ({ ...c }));
+		out[slot] = slotConds[slot].map(c => ({ ...c, extraData: cloneExtraData(c.extraData) }));
 	}
 	return out;
 }
@@ -628,17 +709,22 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 	 *
 	 * Restoration ordering matters here:
 	 *
-	 *   1. Capture transferred-Pokemon states (read live active slots)
-	 *   2. Remove transferred Pokemon from the live battle
-	 *   3. Snapshot the source timeline post-removal
-	 *   4. Restore FIELD from target turn (battle-scoped, once)
-	 *   5. Restore BOTH SIDES' side conditions from target turn
-	 *      — must finish before any switchIn so entry hazards are correct
-	 *   6. Rebuild each side's team + switch in
-	 *      — transferring side uses full switchIn → hazards trigger
-	 *      — non-transferring side uses direct placement → no re-trigger
-	 *   7. Restore slot conditions (team rebuild in step 6 clears them)
-	 *   8. Register branch, snapshot its initial state
+	 *   1.  Capture transferred-Pokemon states (read live active slots)
+	 *   2.  Remove transferred Pokemon from the live battle
+	 *   3.  Snapshot the source timeline post-removal
+	 *   4.  Restore FIELD from target turn (battle-scoped, once)
+	 *       — source refs left null; patched in step 6b
+	 *   5.  Restore BOTH SIDES' side conditions from target turn
+	 *       — must finish before any switchIn so entry hazards are correct
+	 *       — source refs left null; patched in step 6b
+	 *   6.  Rebuild each side's team + switch in
+	 *       — transferring side uses full switchIn → hazards trigger
+	 *       — non-transferring side uses direct placement → no re-trigger
+	 *   6b. Reconnect source refs on field + side conditions
+	 *       — findPokemonByName now resolves against the rebuilt roster
+	 *   7.  Restore slot conditions (team rebuild in step 6 clears them)
+	 *       — source lookup works here since it runs post-rebuild
+	 *   8.  Register branch, snapshot its initial state
 	 */
 	private executeTransferGroup(transfers: PendingTransfer[]) {
 		if (transfers.length === 0) return;
@@ -694,17 +780,23 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 
 		// ── Step 4: Restore field from the target turn ──
 		// Field is battle-scoped — restore once, not per-side.
+		// source refs are left null here; step 6b patches them.
 		const targetField = this.getStoredField(targetGlobalId, targetTurn);
 		console.log(`[TIMELINE DEBUG] Restoring field from ${targetGlobalId} turn ${targetTurn}: weather=${targetField?.weather?.id || 'none'}, terrain=${targetField?.terrain?.id || 'none'}`);
-		this.manager.restoreFieldSilently(sourceBattleId, targetField);
+		this.manager.restoreField(sourceBattleId, targetField);
 
 		// ── Step 5: Restore both sides' side conditions ──
 		// Must complete for BOTH sides before any switchIn, so the transferred
-		// Pokemon sees the correct hazards when it enters.
+		// Pokemon sees the correct hazards when it enters. source refs left
+		// null; step 6b patches them.
+		const sideCondsBySide: { p1: SideConditionSnapshot[] | null; p2: SideConditionSnapshot[] | null } = {
+			p1: null, p2: null,
+		};
 		for (const side of allSides) {
 			const sideConds = this.getStoredSideConditions(targetGlobalId, targetTurn, side);
+			sideCondsBySide[side] = sideConds;
 			console.log(`[TIMELINE DEBUG] Restoring ${side} side conditions from ${targetGlobalId} turn ${targetTurn}: [${sideConds?.map(c => c.id).join(', ') || 'none'}]`);
-			this.manager.restoreSideConditionsSilently(sourceBattleId, side, sideConds);
+			this.manager.restoreSideConditions(sourceBattleId, side, sideConds);
 		}
 
 		// ── Step 6: Rebuild each side from the target turn's snapshot ──
@@ -745,13 +837,24 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 			}
 		}
 
+		// ── Step 6b: Reconnect source refs on field & side conditions ──
+		// Teams are rebuilt; findPokemonByName can now resolve the source
+		// names captured in the snapshot against the correct roster.
+		this.manager.reconnectConditionSources(
+			sourceBattleId,
+			targetField,
+			sideCondsBySide.p1,
+			sideCondsBySide.p2,
+		);
+
 		// ── Step 7: Restore slot conditions ──
-		// Team rebuild in step 6 cleared slotConditions to {}, so this runs after.
+		// Team rebuild in step 6 cleared slotConditions to {}, so this runs
+		// after. source lookup works here since teams are already rebuilt.
 		for (const side of allSides) {
 			const slotConds = this.getStoredSlotConditions(targetGlobalId, targetTurn, side);
 			if (slotConds && Object.keys(slotConds).length > 0) {
 				console.log(`[TIMELINE DEBUG] Restoring ${side} slot conditions from ${targetGlobalId} turn ${targetTurn}`);
-				this.manager.restoreSlotConditionsSilently(sourceBattleId, side, slotConds);
+				this.manager.restoreSlotConditions(sourceBattleId, side, slotConds);
 			}
 		}
 
@@ -990,8 +1093,9 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 	 * snapshot. Returns true if a switch happened.
 	 *
 	 * Same phase ordering as executeTransferGroup: field → side conditions
-	 * → teams → slot conditions. Both sides use direct placement here
-	 * (restoreTeamFromSnapshot), since nobody is a new arrival.
+	 * → teams → reconnect sources → slot conditions. Both sides use direct
+	 * placement here (restoreTeamFromSnapshot), since nobody is a new
+	 * arrival.
 	 */
 	private switchToPresentIfNeeded(): boolean {
 		const presentId = this.computePresentId();
@@ -1011,17 +1115,18 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 		const outBattle = outEntry ? this.manager.getBattle(outEntry.battleId) : null;
 		if (outBattle) this.captureSnapshot(outgoingId, outBattle);
 
-		// ── Field (once) ──
+		// ── Field (once) — source refs patched post-rebuild ──
 		const presentField = this.getStoredField(presentId, presentTurn);
 		console.log(`[TIMELINE DEBUG] Present-shift field: weather=${presentField?.weather?.id || 'none'}, terrain=${presentField?.terrain?.id || 'none'}`);
-		this.manager.restoreFieldSilently(entry.battleId, presentField);
+		this.manager.restoreField(entry.battleId, presentField);
 
 		// ── Side conditions (both sides, before any placement) ──
-		for (const side of ['p1', 'p2'] as const) {
-			const sideConds = this.getStoredSideConditions(presentId, presentTurn, side);
-			console.log(`[TIMELINE DEBUG] Present-shift ${side} conditions: [${sideConds?.map(c => c.id).join(', ') || 'none'}]`);
-			this.manager.restoreSideConditionsSilently(entry.battleId, side, sideConds);
-		}
+		const p1SideConds = this.getStoredSideConditions(presentId, presentTurn, 'p1');
+		const p2SideConds = this.getStoredSideConditions(presentId, presentTurn, 'p2');
+		console.log(`[TIMELINE DEBUG] Present-shift p1 conditions: [${p1SideConds?.map(c => c.id).join(', ') || 'none'}]`);
+		console.log(`[TIMELINE DEBUG] Present-shift p2 conditions: [${p2SideConds?.map(c => c.id).join(', ') || 'none'}]`);
+		this.manager.restoreSideConditions(entry.battleId, 'p1', p1SideConds);
+		this.manager.restoreSideConditions(entry.battleId, 'p2', p2SideConds);
 
 		// ── Teams (both sides use direct placement) ──
 		for (const side of ['p1', 'p2'] as const) {
@@ -1032,11 +1137,14 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 			}
 		}
 
+		// ── Reconnect source refs now that teams exist ──
+		this.manager.reconnectConditionSources(entry.battleId, presentField, p1SideConds, p2SideConds);
+
 		// ── Slot conditions (after team rebuild cleared them) ──
 		for (const side of ['p1', 'p2'] as const) {
 			const slotConds = this.getStoredSlotConditions(presentId, presentTurn, side);
 			if (slotConds && Object.keys(slotConds).length > 0) {
-				this.manager.restoreSlotConditionsSilently(entry.battleId, side, slotConds);
+				this.manager.restoreSlotConditions(entry.battleId, side, slotConds);
 			}
 		}
 

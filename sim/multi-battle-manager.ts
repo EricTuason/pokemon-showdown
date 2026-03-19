@@ -172,6 +172,25 @@ export interface SideSnapshot {
 }
 
 /**
+ * Snapshot of a volatile condition on an active Pokemon (Substitute,
+ * Encore, Taunt, Leech Seed, Confusion, etc.).
+ *
+ * Same shape as the other condition snapshots so the same capture and
+ * restore machinery can handle all of them. extraData is load-bearing
+ * here: Substitute stores `hp`, Encore and Disable store `move`,
+ * Stockpile stores `layers`, Confusion stores `time`. Without it the
+ * volatile exists on the engine side but its mechanics resolve wrong.
+ */
+export interface VolatileSnapshot {
+	id: string;
+	turnsLeft?: number;
+	source?: string;      // Pokemon name, for findPokemonByName reconnection
+	sourceSlot?: string;
+	/** See FieldConditionSnapshot.extraData. */
+	extraData?: { [key: string]: any };
+}
+
+/**
  * Full Pokemon snapshot - stored internally for state restoration.
  * Contains all data needed to restore a Pokemon's state.
  */
@@ -188,7 +207,11 @@ export interface PokemonSnapshot {
 	ability: string;
 	moves: string[];
 	position: number;
-	volatiles: string[];
+	/**
+	 * Full volatile EffectState data, not just IDs. The old string[]
+	 * shape lost Substitute HP, Encore move, Taunt duration, etc.
+	 */
+	volatiles: VolatileSnapshot[];
 }
 
 /**
@@ -1550,6 +1573,19 @@ export class MultiBattleManager {
 		const maxhp = pokemon.maxhp || 100;
 		const hpPercent = fainted ? 0 : (maxhp > 0 ? Math.round((pokemon.hp / maxhp) * 100) : 0);
 
+		// Volatiles: basic fields only. This path is inspection-only (external
+		// getSnapshot() API), not restoration, so extraData is left off.
+		const volatiles: VolatileSnapshot[] = [];
+		for (const id in pokemon.volatiles) {
+			const state = pokemon.volatiles[id];
+			volatiles.push({
+				id,
+				turnsLeft: state.duration,
+				source: state.source?.name,
+				sourceSlot: state.sourceSlot,
+			});
+		}
+
 		return {
 			name: pokemon.name,
 			species: pokemon.species.name,
@@ -1563,7 +1599,7 @@ export class MultiBattleManager {
 			ability: pokemon.ability,
 			moves: pokemon.moveSlots.map(m => m.id),
 			position: pokemon.position,
-			volatiles: Object.keys(pokemon.volatiles),
+			volatiles,
 		};
 	}
 
@@ -1914,44 +1950,87 @@ export class MultiBattleManager {
 		}
 
 		// ── STEP 6: Apply boosts and volatiles to the placed Pokemon ──
-		// These are applied after placement because a real switchIn would have
-		// cleared them; here we're restoring a snapshot where they were present.
+		// Applied AFTER the |switch| line above so the client has a Pokemon
+		// in the slot to attach them to. A real switchIn would have cleared
+		// both; here we're restoring a snapshot where they were already
+		// present on this Pokemon at the target turn.
+		//
+		// Protocol lines (|-setboost|, |-start|) are emitted with [silent]
+		// so the client updates its stat-arrow and volatile-icon trackers
+		// without narrating each one into the battle log.
 		if (placeMon && activeDisplayData) {
+			// ── Boosts ──
 			if (activeDisplayData.boosts) {
 				const boostKeys = ['atk', 'def', 'spa', 'spd', 'spe', 'accuracy', 'evasion'] as const;
 				for (const stat of boostKeys) {
 					const boost = activeDisplayData.boosts[stat];
 					if (boost !== undefined && boost !== 0) {
 						placeMon.boosts[stat] = boost;
+						// |-setboost| is an absolute value, unlike the
+						// delta-based |-boost| / |-unboost|. Matches what
+						// Belly Drum and Anger Point emit.
+						battle.add('-setboost', placeMon, stat, boost, '[silent]');
 					}
 				}
 				console.log(`[Timeline Team]   Applied boosts: ${JSON.stringify(activeDisplayData.boosts)}`);
 			}
 
+			// ── Volatiles ──
+			// Denylist instead of whitelist: skip only single-turn flags
+			// and mid-move state that would desync the move-resolution
+			// state machine if restored out of sequence. Everything else
+			// is restored with its full captured EffectState payload.
 			if (activeDisplayData.volatiles && activeDisplayData.volatiles.length > 0) {
-				const safeVolatiles = new Set([
-					'substitute', 'confusion', 'leechseed', 'curse',
-					'embargo', 'healblock', 'partiallytrapped',
-					'taunt', 'torment', 'encore', 'disable', 'attract',
-					'focusenergy', 'magnetrise', 'aquaring', 'ingrain',
-					'flashfire', 'slowstart', 'truant', 'unburden',
-					'charge', 'defensecurl', 'lockon', 'minimize',
-					'stockpile', 'stockpile1', 'stockpile2', 'stockpile3',
+				const skipVolatiles = new Set([
+					// Single-turn flags the engine clears at turn boundaries
+					'flinch', 'endure', 'protect', 'quickguard', 'wideguard',
+					'destinybond', 'grudge', 'roost', 'gem', 'stall',
+					// Mid-move state — restoring these out of sequence
+					// corrupts the action-resolution state machine
+					'mustrecharge', 'twoturnmove', 'lockedmove',
 				]);
 
 				const appliedVolatiles: string[] = [];
+				const skippedVolatiles: string[] = [];
+
 				for (const vol of activeDisplayData.volatiles) {
-					if (safeVolatiles.has(vol)) {
-						placeMon.volatiles[vol] = {
-							id: vol as any,
-							target: placeMon,
-							effectOrder: 0,
-						};
-						appliedVolatiles.push(vol);
+					if (!vol.id) continue;
+					if (skipVolatiles.has(vol.id)) {
+						skippedVolatiles.push(vol.id);
+						continue;
 					}
+
+					// This runs post-rebuild (placeMon was just created and
+					// placed), so source lookup hits the correct roster.
+					const src = this.findPokemonByName(battle, vol.source);
+
+					const state = battle.initEffectState({
+						id: vol.id as any,
+						target: placeMon,
+						source: src,
+						sourceSlot: vol.sourceSlot,
+						duration: vol.turnsLeft,
+					});
+					if (vol.extraData) {
+						for (const key in vol.extraData) {
+							state[key] = vol.extraData[key];
+						}
+					}
+					placeMon.volatiles[vol.id] = state;
+					appliedVolatiles.push(vol.id);
+
+					// |-start| updates the client's volatile tracker.
+					// [silent] keeps it out of the log; most clients still
+					// draw the icon / overlay on silent starts.
+					const condName = battle.dex.conditions.getByID(vol.id as any)?.name || vol.id;
+					battle.add('-start', placeMon, condName, '[silent]');
 				}
+
 				if (appliedVolatiles.length > 0) {
 					console.log(`[Timeline Team]   Applied volatiles: [${appliedVolatiles.join(', ')}]`);
+				}
+				if (skippedVolatiles.length > 0) {
+					console.log(`[Timeline Team]   Skipped single-turn/mid-move volatiles: [${skippedVolatiles.join(', ')}]`);
 				}
 			}
 		}

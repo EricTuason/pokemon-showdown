@@ -14,6 +14,7 @@ import {
 	FieldConditionSnapshot,
 	SideConditionSnapshot,
 	SlotConditionSnapshot,
+	VolatileSnapshot,
 } from './multi-battle-manager';
 
 export interface TimelineNodeData {
@@ -61,6 +62,36 @@ function pokemonToSpriteId(pokemon: any): string {
 		.replace(/[^a-z0-9-]/g, '');
 }
 
+/**
+ * Captures an active Pokemon's volatiles with full EffectState data.
+ *
+ * Same approach as extractSideConditions: id + duration + source name +
+ * sourceSlot + extraData for everything else. extraData picks up the
+ * volatile-specific fields that make the condition actually work —
+ * Substitute's `hp`, Encore's `move`, Stockpile's `layers`,
+ * Confusion's `time`, Leech Seed's source tracking.
+ *
+ * Without this, the old string[] capture let restoreTeamFromSnapshot
+ * put a Substitute back on a Pokemon, but the first attack of any
+ * strength would break it because the sub's hp was never stored.
+ */
+function extractVolatileSnapshots(pokemon: any): VolatileSnapshot[] {
+	if (!pokemon?.volatiles) return [];
+
+	const out: VolatileSnapshot[] = [];
+	for (const id in pokemon.volatiles) {
+		const state = pokemon.volatiles[id];
+		out.push({
+			id,
+			turnsLeft: state.duration,
+			source: state.source?.name,
+			sourceSlot: state.sourceSlot,
+			extraData: extractExtraEffectData(state),
+		});
+	}
+	return out;
+}
+
 function extractTeamSnapshot(side: any): PokemonSnapshot[] {
 	if (!side) return [];
 	const team: any[] = side.pokemon || [];
@@ -97,12 +128,16 @@ function extractTeamSnapshot(side: any): PokemonSnapshot[] {
 			ability: pokemon.ability || '',
 			moves: pokemon.moveSlots?.map((m: any) => m.id) || [],
 			position: pokemon.position ?? -1,
-			volatiles: isActive && !fainted && pokemon.volatiles
-				? Object.keys(pokemon.volatiles)
+			// Full EffectState capture instead of just Object.keys().
+			// Bench Pokemon don't have volatiles (they're cleared on switch
+			// out), so this is only non-empty for the active slot.
+			volatiles: isActive && !fainted
+				? extractVolatileSnapshots(pokemon)
 				: [],
 		};
 	});
 }
+
 
 /**
  * EffectState keys that are either handled explicitly by the snapshot
@@ -346,7 +381,7 @@ function deepCloneSnapshot(p: PokemonSnapshot): PokemonSnapshot {
 	return {
 		...p,
 		boosts: { ...p.boosts },
-		volatiles: [...p.volatiles],
+		volatiles: p.volatiles.map(v => ({ ...v, extraData: cloneExtraData(v.extraData) })),
 		moves: [...p.moves],
 	};
 }

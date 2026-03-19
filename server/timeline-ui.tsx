@@ -1,5 +1,3 @@
-// server/timeline-ui.ts
-
 /**
  * Timeline UI - Data-driven tree visualizer
  *
@@ -28,6 +26,10 @@ const LANE_COLORS = [
 	'#70a0ff', '#b090ff', '#70e080', '#f0d070',
 	'#ff7088', '#70d0e0', '#ffa070', '#f0a0c0',
 ];
+
+// Distinct "current node" accent — deliberately NOT close to any lane color.
+const CURRENT_COLOR = '#111111';
+const CURRENT_GLOW  = 'rgba(0,0,0,0.35)';
 
 // ── Shared types ────────────────────────────────────────
 
@@ -91,6 +93,8 @@ interface Connection {
 	x2: number; y2: number;
 	color: string;
 	dotColor?: string;
+	/** For branch connections: routed waypoints [x,y,…] to avoid nodes */
+	path?: number[];
 }
 
 // ── Helpers ─────────────────────────────────────────────
@@ -141,8 +145,6 @@ function computeLayout(data: TimelineNodeData[]): {
 	for (const arr of grouped.values()) arr.sort((a, b) => a.turn - b.turn);
 
 	// We need per-row max heights to compute y positions
-	// First pass: compute node heights per (col, row)
-	// For y positioning we use the max nodeH in each row
 	const rowMaxH = new Map<number, number>();
 	for (const [, tlNodes] of grouped) {
 		for (const d of tlNodes) {
@@ -226,21 +228,44 @@ function computeLayout(data: TimelineNodeData[]): {
 		}
 	}
 
-	// Branch lines
+	// Branch lines — routed through the gutter between columns so they
+	// never cross through intervening node boxes.
 	for (const n of nodes) {
 		if (!n.isBranch || n.branchFromCol === null || n.branchFromRow === null) continue;
+
+		const parentColor = LANE_COLORS[n.branchFromCol % LANE_COLORS.length];
+
+		// Right edge of parent node, at its vertical center
 		const px = PAD + n.branchFromCol * (NODE_W + GAP_X) + NODE_W;
 		const parentRowH = rowMaxH.get(n.branchFromRow) || NODE_H_BASE;
 		const py = (rowY.get(n.branchFromRow) || PAD) + parentRowH / 2;
-		const parentColor = LANE_COLORS[n.branchFromCol % LANE_COLORS.length];
+
+		// Target: top center of child node (enter from above, not the side)
+		const tx = n.x + NODE_W / 2;
+		const ty = n.y;
+
+		// Gutter x just left of the child column
+		const gutterX = n.x - GAP_X / 2;
+
+		// Row-gap y just above the child row
+		const gapY = n.y - GAP_Y / 2;
+
+		// Route: parent-right → gutter (horizontal) → down gutter to row-gap
+		//        → across row-gap to above child → down into child top
+		const path = [
+			px,      py,
+			gutterX, py,
+			gutterX, gapY,
+			tx,      gapY,
+			tx,      ty,
+		];
+
 		connections.push({
 			type: 'branch',
-			x1: px,
-			y1: py,
-			x2: n.x,
-			y2: n.y + n.nodeH / 2,
+			x1: px, y1: py, x2: tx, y2: ty,
 			color: n.color,
 			dotColor: parentColor,
+			path,
 		});
 	}
 
@@ -274,11 +299,6 @@ function pokeRowHTML(poke: PokemonSnapshot): string {
 		: poke.hp > 20 ? '#f0d040'
 		: '#e04040';
 
-	const activeDot = poke.isActive
-		? '<div style="width:5px;height:5px;border-radius:50%;background:#4caf50;' +
-		  'flex-shrink:0;align-self:center;margin-right:2px;"></div>'
-		: '<div style="width:5px;flex-shrink:0;margin-right:2px;"></div>';
-
 	const statusBadge = poke.status && !fainted
 		? `<span style="display:inline-block;font-size:6px;padding:0 2px;border-radius:2px;` +
 		  `background:#888;color:white;margin-left:2px;text-transform:uppercase;` +
@@ -294,7 +314,6 @@ function pokeRowHTML(poke: PokemonSnapshot): string {
 
 	return '<div style="display:flex;align-items:center;height:' + ROW_H + 'px;' +
 		'padding:0 4px;box-sizing:border-box;">' +
-		activeDot +
 		// Sprite
 		`<img src="${gen5Sprite(poke.species)}" width="20" height="15" ` +
 		`style="image-rendering:pixelated;flex-shrink:0;${imgStyle}" />` +
@@ -334,15 +353,28 @@ function sideBlockHTML(team: PokemonSnapshot[], label: string, borderColor: stri
 }
 
 function nodeCardHTML(node: LayoutNode): string {
-	const borderW = node.isCurrent ? 3 : 2;
-	const borderColor = node.isCurrent ? '#ff6b6b' : node.color;
-	const bg = node.ended ? '#f5f5f5' : (node.isCurrent ? '#fff8f0' : 'white');
-	const shadow = node.isCurrent ? 'box-shadow:0 0 8px rgba(255,107,107,0.4);' : '';
+	const borderW = node.isCurrent ? 4 : 2;
+	const borderColor = node.isCurrent ? CURRENT_COLOR : node.color;
+	const bg = node.ended ? '#f5f5f5' : (node.isCurrent ? '#fffef5' : 'white');
+
+	// Heavy, unmissable treatment for the current node: thick dark border,
+	// offset outline ring, drop shadow, and a "CURRENT" corner ribbon.
+	const currentRing = node.isCurrent
+		? `outline:3px solid ${node.color};outline-offset:3px;` +
+		  `box-shadow:0 0 0 1px white,0 2px 14px ${CURRENT_GLOW};`
+		: '';
+
+	const currentBadge = node.isCurrent
+		? `<div style="position:absolute;top:-12px;left:-6px;font-size:9px;` +
+		  `font-weight:bold;letter-spacing:0.5px;background:${CURRENT_COLOR};` +
+		  `color:white;padding:2px 8px;border-radius:4px;z-index:3;` +
+		  `box-shadow:0 1px 4px rgba(0,0,0,0.3);">\u25B6 CURRENT</div>`
+		: '';
 
 	const branchTag = node.branchLabel
 		? `<div style="position:absolute;top:-9px;right:6px;font-size:7px;` +
 		  `background:#e74c3c;color:white;padding:1px 5px;border-radius:3px;` +
-		  `white-space:nowrap;z-index:1;">${node.branchLabel}</div>`
+		  `white-space:nowrap;z-index:2;">${node.branchLabel}</div>`
 		: '';
 
 	const endedBadge = node.ended
@@ -353,15 +385,18 @@ function nodeCardHTML(node: LayoutNode): string {
 	const p2HTML = sideBlockHTML(node.p2Team, 'P2', '#e07070');
 
 	return `<div style="position:absolute;left:${node.x}px;top:${node.y}px;` +
-		`width:${NODE_W}px;height:${node.nodeH}px;">` +
+		`width:${NODE_W}px;height:${node.nodeH}px;` +
+		`${node.isCurrent ? 'z-index:5;' : ''}">` +
+		currentBadge +
 		`<div style="width:100%;height:100%;border:${borderW}px solid ${borderColor};` +
-		`border-radius:8px;background:${bg};${shadow}overflow:hidden;position:relative;` +
+		`border-radius:8px;background:${bg};${currentRing}position:relative;` +
 		`box-sizing:border-box;">` +
 		branchTag +
 		// Header
 		`<div style="display:flex;justify-content:space-between;align-items:center;` +
 		`height:${HEADER_H}px;padding:0 8px;background:${node.color}18;` +
-		`border-bottom:1px solid ${node.color}40;flex-shrink:0;">` +
+		`border-bottom:1px solid ${node.color}40;flex-shrink:0;` +
+		`border-radius:6px 6px 0 0;">` +
 		`<span style="font-size:10px;font-weight:bold;color:#444;">` +
 		`Turn ${node.turn}${endedBadge}</span>` +
 		`<span style="font-size:9px;font-weight:bold;color:${node.color};">#${node.timelineNum}</span>` +
@@ -380,21 +415,57 @@ function verticalLineHTML(c: Connection): string {
 		`opacity:0.6;"></div>`;
 }
 
-function branchLineHTML(c: Connection): string {
-	const dx = c.x2 - c.x1;
-	const dy = c.y2 - c.y1;
-	const len = Math.sqrt(dx * dx + dy * dy);
-	const angle = Math.atan2(dy, dx) * (180 / Math.PI);
+/** Render a single axis-aligned dashed segment. */
+function dashedSegment(x1: number, y1: number, x2: number, y2: number, color: string): string {
+	if (x1 === x2) {
+		// vertical
+		const top = Math.min(y1, y2);
+		const h = Math.abs(y2 - y1);
+		if (h <= 0) return '';
+		return `<div style="position:absolute;left:${x1 - 1}px;top:${top}px;` +
+			`width:0;height:${h}px;border-left:2px dashed ${color};` +
+			`opacity:0.75;"></div>`;
+	} else {
+		// horizontal
+		const left = Math.min(x1, x2);
+		const w = Math.abs(x2 - x1);
+		if (w <= 0) return '';
+		return `<div style="position:absolute;left:${left}px;top:${y1 - 1}px;` +
+			`width:${w}px;height:0;border-top:2px dashed ${color};` +
+			`opacity:0.75;"></div>`;
+	}
+}
 
-	return (
-		`<div style="position:absolute;left:${c.x1}px;top:${c.y1}px;` +
-		`width:${Math.round(len)}px;height:0;border-top:2px dashed ${c.color};` +
-		`transform-origin:0 0;transform:rotate(${angle.toFixed(1)}deg);` +
-		`opacity:0.7;"></div>` +
-		`<div style="position:absolute;left:${c.x1 - 5}px;top:${c.y1 - 5}px;` +
+function branchLineHTML(c: Connection): string {
+	let segs = '';
+
+	if (c.path && c.path.length >= 4) {
+		for (let i = 0; i < c.path.length - 2; i += 2) {
+			segs += dashedSegment(
+				c.path[i], c.path[i + 1],
+				c.path[i + 2], c.path[i + 3],
+				c.color
+			);
+		}
+	} else {
+		// Fallback: straight rotated line (legacy)
+		const dx = c.x2 - c.x1;
+		const dy = c.y2 - c.y1;
+		const len = Math.sqrt(dx * dx + dy * dy);
+		const angle = Math.atan2(dy, dx) * (180 / Math.PI);
+		segs = `<div style="position:absolute;left:${c.x1}px;top:${c.y1}px;` +
+			`width:${Math.round(len)}px;height:0;border-top:2px dashed ${c.color};` +
+			`transform-origin:0 0;transform:rotate(${angle.toFixed(1)}deg);` +
+			`opacity:0.75;"></div>`;
+	}
+
+	// Origin dot on parent edge
+	const dot = `<div style="position:absolute;left:${c.x1 - 5}px;top:${c.y1 - 5}px;` +
 		`width:10px;height:10px;border-radius:50%;` +
-		`background:${c.dotColor || c.color};border:2px solid white;"></div>`
-	);
+		`background:${c.dotColor || c.color};border:2px solid white;` +
+		`box-shadow:0 0 0 1px ${c.dotColor || c.color};"></div>`;
+
+	return segs + dot;
 }
 
 // ── Main export ─────────────────────────────────────────
@@ -441,11 +512,9 @@ export function generateTimelineHTML(data: {nodes: TimelineNodeData[]}): string 
 		'<div style="width:16px;border-top:2px dashed #e74c3c;"></div>' +
 		'<span>Branch</span></div>';
 	const currentLeg = '<div style="display:inline-flex;align-items:center;gap:4px;">' +
-		'<div style="width:10px;height:10px;border-radius:50%;border:2px solid #ff6b6b;"></div>' +
+		`<div style="width:12px;height:12px;border-radius:3px;` +
+		`border:3px solid ${CURRENT_COLOR};box-sizing:border-box;"></div>` +
 		'<span>Current</span></div>';
-	const activeLeg = '<div style="display:inline-flex;align-items:center;gap:4px;">' +
-		'<div style="width:6px;height:6px;border-radius:50%;background:#4caf50;"></div>' +
-		'<span>Active</span></div>';
 
 	return '<div style="margin:8px 0;padding:12px;border:2px solid #aaa;border-radius:6px;' +
 		'background:white;font-family:Arial,Helvetica,sans-serif;">' +
@@ -468,6 +537,6 @@ export function generateTimelineHTML(data: {nodes: TimelineNodeData[]}): string 
 		'<div style="display:flex;gap:16px;margin-top:10px;padding-top:8px;' +
 		'border-top:1px solid #ddd;flex-wrap:wrap;justify-content:center;' +
 		'font-size:11px;color:#666;">' +
-		legendItems + branchLeg + currentLeg + activeLeg +
+		legendItems + branchLeg + currentLeg +
 		'</div></div>';
 }

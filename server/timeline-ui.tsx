@@ -11,9 +11,6 @@ const SP = 'https://play.pokemonshowdown.com/sprites';
  * ── Node width budget ─────────────────────────────────────────────
  * Computed once, statically. We do NOT measure at render time.
  *
- * Widest path through a node = one pokemon row, inside a side block,
- * inside a node card (all with their own padding/borders/margins):
- *
  *   node border (current, worst case)   4 × 2  =   8
  *   side-block horizontal margin        4 × 2  =   8
  *   side-block border                   1 × 2  =   2
@@ -24,33 +21,24 @@ const SP = 'https://play.pokemonshowdown.com/sprites';
  *     (≈5.8 px/char avg worst-case)     18 × 5.8 ≈ 105
  *   status badge — 2px margin + 4px pad
  *     + 3 glyphs @ 6px (≈12px)                   =  18
- *   safety slack (anti-ellipsis)                 =   2
+ *   safety slack                                 =   2
  *   ─────────────────────────────────────────────────────
  *   TOTAL                                        = 174
- *
- * Change any of the constituent constants below → re-check this sum.
  */
 const NODE_W = 174;
 
-// Height scales with team size; base header + per-row height
 const HEADER_H = 28;
 const SIDE_LABEL_H = 14;
-const ROW_H = 22;        // height per pokemon row
-const SIDE_PAD = 4;      // padding inside a side block
+const ROW_H = 22;
+const SIDE_PAD = 4;
 const MAX_TEAM = 6;
-// NODE_H is computed dynamically per node based on team sizes
-// For layout purposes we use a fixed estimate:
 const NODE_H_BASE = HEADER_H + (SIDE_LABEL_H + SIDE_PAD * 2 + ROW_H * MAX_TEAM) * 2 + 8;
 
 const GAP_X = 32;
 const GAP_Y = 24;
 const PAD  = 28;
 
-/**
- * Fixed HP-bar width, expressed in px so it never varies with the
- * surrounding text. 64px ≈ 8 × an 'm' at the row's 8-px font.
- * Tweak this single knob to resize every bar.
- */
+/** Fixed HP-bar width in px (≈ 8 'm' widths at the row's 8px font). */
 const HP_BAR_PX = 64;
 
 const LANE_COLORS = [
@@ -58,7 +46,6 @@ const LANE_COLORS = [
 	'#ff7088', '#70d0e0', '#ffa070', '#f0a0c0',
 ];
 
-// Distinct "current node" accent — deliberately NOT close to any lane color.
 const CURRENT_COLOR = '#111111';
 const CURRENT_GLOW  = 'rgba(0,0,0,0.35)';
 
@@ -66,14 +53,10 @@ const CURRENT_GLOW  = 'rgba(0,0,0,0.35)';
 
 export interface PokemonSnapshot {
 	name: string;
-	/** Sprite-compatible id: "deoxys-speed", "alomomola" */
 	species: string;
-	/** HP as percentage 0-100 */
 	hp: number;
-	/** Whether this pokemon is currently active on the field */
 	isActive?: boolean;
 	status?: string;
-	/** Whether this pokemon has fainted */
 	fainted?: boolean;
 }
 
@@ -85,14 +68,10 @@ export interface TimelineNodeData {
 	branchTurn: number | null;
 	isCurrent: boolean;
 	ended: boolean;
-	/** Full team snapshot for player 1 */
 	p1Team: PokemonSnapshot[];
-	/** Full team snapshot for player 2 */
 	p2Team: PokemonSnapshot[];
-	/** @deprecated use p1Team[].isActive instead */
-	p1Active?: PokemonSnapshot | null;
-	/** @deprecated use p2Team[].isActive instead */
-	p2Active?: PokemonSnapshot | null;
+	/** @deprecated */ p1Active?: PokemonSnapshot | null;
+	/** @deprecated */ p2Active?: PokemonSnapshot | null;
 }
 
 // ── Internal layout types ───────────────────────────────
@@ -124,7 +103,6 @@ interface Connection {
 	x2: number; y2: number;
 	color: string;
 	dotColor?: string;
-	/** For branch connections: routed waypoints [x,y,…] to avoid nodes */
 	path?: number[];
 }
 
@@ -175,7 +153,6 @@ function computeLayout(data: TimelineNodeData[]): {
 	}
 	for (const arr of grouped.values()) arr.sort((a, b) => a.turn - b.turn);
 
-	// We need per-row max heights to compute y positions
 	const rowMaxH = new Map<number, number>();
 	for (const [, tlNodes] of grouped) {
 		for (const d of tlNodes) {
@@ -187,7 +164,6 @@ function computeLayout(data: TimelineNodeData[]): {
 		}
 	}
 
-	// Compute cumulative y offsets per row
 	const rowY = new Map<number, number>();
 	let yAccum = PAD;
 	const sortedRows = [...new Set(data.map(n => rowFor.get(n.turn) || 0))].sort((a, b) => a - b);
@@ -196,7 +172,6 @@ function computeLayout(data: TimelineNodeData[]): {
 		yAccum += (rowMaxH.get(row) || NODE_H_BASE) + GAP_Y;
 	}
 
-	// Build layout nodes
 	const nodes: LayoutNode[] = [];
 	for (const [tlId, tlNodes] of grouped) {
 		const col = colFor.get(tlId) || 0;
@@ -237,7 +212,6 @@ function computeLayout(data: TimelineNodeData[]): {
 		});
 	}
 
-	// Build connections
 	const connections: Connection[] = [];
 
 	// Vertical lines within each timeline
@@ -259,8 +233,9 @@ function computeLayout(data: TimelineNodeData[]): {
 		}
 	}
 
-	// Branch lines — routed through the gutter between columns so they
-	// never cross through intervening node boxes.
+	// Branch lines — routed strictly through gutters/row-gaps so they
+	// never cross a node box, with a small per-branch offset so lines
+	// sharing a gutter don't stack on top of each other.
 	for (const n of nodes) {
 		if (!n.isBranch || n.branchFromCol === null || n.branchFromRow === null) continue;
 
@@ -271,24 +246,36 @@ function computeLayout(data: TimelineNodeData[]): {
 		const parentRowH = rowMaxH.get(n.branchFromRow) || NODE_H_BASE;
 		const py = (rowY.get(n.branchFromRow) || PAD) + parentRowH / 2;
 
-		// Target: top center of child node (enter from above, not the side)
+		// Target: top-center of child node
 		const tx = n.x + NODE_W / 2;
 		const ty = n.y;
 
-		// Gutter x just left of the child column
-		const gutterX = n.x - GAP_X / 2;
+		// Per-branch jitter keyed off the child column (unique per
+		// branch). 5 lanes spread across the gutter/row-gap; values
+		// chosen to stay comfortably inside GAP_X/2 and GAP_Y/2.
+		const lane = n.col % 5;                 // 0..4
+		const xJit = (lane - 2) * 3;            // -6,-3,0,+3,+6
+		const yJit = (lane - 2) * 2;            // -4,-2,0,+2,+4
 
-		// Row-gap y just above the child row
-		const gapY = n.y - GAP_Y / 2;
+		// Gutter immediately RIGHT of the PARENT column — the first
+		// horizontal hop is never more than half a gutter wide, so it
+		// cannot cross an intermediate column.
+		const parentGutterX = px + GAP_X / 2 + xJit;
 
-		// Route: parent-right → gutter (horizontal) → down gutter to row-gap
-		//        → across row-gap to above child → down into child top
+		// Row-gap immediately ABOVE the child row — the long horizontal
+		// traverse runs here, between rows, guaranteed node-free.
+		const gapY = ty - GAP_Y / 2 + yJit;
+
+		//   parent-right → parent's right gutter
+		//   ↓ down gutter to row-gap above child
+		//   → across row-gap to child's x-center
+		//   ↓ into child top
 		const path = [
-			px,      py,
-			gutterX, py,
-			gutterX, gapY,
-			tx,      gapY,
-			tx,      ty,
+			px,            py,
+			parentGutterX, py,
+			parentGutterX, gapY,
+			tx,            gapY,
+			tx,            ty,
 		];
 
 		connections.push({
@@ -318,12 +305,6 @@ function gen5Sprite(speciesId: string): string {
 
 // ── HTML fragments ──────────────────────────────────────
 
-/**
- * Renders a single pokemon row inside a side block.
- * Layout:
- *   [sprite 20×15]  [ name + status badge
- *                     HP bar (fixed width, directly below name) ]
- */
 function pokeRowHTML(poke: PokemonSnapshot): string {
 	const fainted = poke.fainted || poke.hp <= 0;
 	const hpColor = fainted
@@ -347,28 +328,19 @@ function pokeRowHTML(poke: PokemonSnapshot): string {
 
 	return '<div style="display:flex;align-items:center;height:' + ROW_H + 'px;' +
 		'padding:0 4px;box-sizing:border-box;">' +
-		// Sprite
 		`<img src="${gen5Sprite(poke.species)}" width="20" height="15" ` +
 		`style="image-rendering:pixelated;flex-shrink:0;${imgStyle}" />` +
-		// Name-block (name on top, fixed-width HP bar beneath)
 		'<div style="flex:1;min-width:0;margin-left:3px;">' +
-		// name line
 		`<div style="font-size:8px;font-weight:${poke.isActive ? 'bold' : 'normal'};` +
 		`${nameStyle}overflow:hidden;text-overflow:ellipsis;white-space:nowrap;` +
 		`line-height:11px;">${poke.name}${statusBadge}</div>` +
-		// HP bar — fixed px width, independent of name length
 		`<div style="width:${HP_BAR_PX}px;height:3px;background:#e0e0e0;` +
 		'border-radius:2px;overflow:hidden;margin-top:1px;">' +
 		`<div style="width:${fainted ? 0 : poke.hp}%;height:100%;background:${hpColor};` +
 		`border-radius:2px;transition:width 0.3s;"></div>` +
-		'</div>' +
-		'</div>' +
-		'</div>';
+		'</div></div></div>';
 }
 
-/**
- * Renders a side block (P1 or P2) with label + all team members.
- */
 function sideBlockHTML(team: PokemonSnapshot[], label: string, borderColor: string): string {
 	const rows = team.length
 		? team.map(p => pokeRowHTML(p)).join('')
@@ -377,7 +349,6 @@ function sideBlockHTML(team: PokemonSnapshot[], label: string, borderColor: stri
 
 	return '<div style="border:1px solid ' + borderColor + '30;border-radius:4px;' +
 		'margin:2px 4px;background:' + borderColor + '08;">' +
-		// Label bar
 		'<div style="font-size:8px;font-weight:bold;color:' + borderColor + ';' +
 		'padding:1px 5px;border-bottom:1px solid ' + borderColor + '30;' +
 		'background:' + borderColor + '14;border-radius:4px 4px 0 0;">' +
@@ -391,8 +362,6 @@ function nodeCardHTML(node: LayoutNode): string {
 	const borderColor = node.isCurrent ? CURRENT_COLOR : node.color;
 	const bg = node.ended ? '#f5f5f5' : (node.isCurrent ? '#fffef5' : 'white');
 
-	// Heavy, unmissable treatment for the current node: thick dark border,
-	// offset outline ring, drop shadow, and a "CURRENT" corner ribbon.
 	const currentRing = node.isCurrent
 		? `outline:3px solid ${node.color};outline-offset:3px;` +
 		  `box-shadow:0 0 0 1px white,0 2px 14px ${CURRENT_GLOW};`
@@ -426,7 +395,6 @@ function nodeCardHTML(node: LayoutNode): string {
 		`border-radius:8px;background:${bg};${currentRing}position:relative;` +
 		`box-sizing:border-box;">` +
 		branchTag +
-		// Header
 		`<div style="display:flex;justify-content:space-between;align-items:center;` +
 		`height:${HEADER_H}px;padding:0 8px;background:${node.color}18;` +
 		`border-bottom:1px solid ${node.color}40;flex-shrink:0;` +
@@ -435,7 +403,6 @@ function nodeCardHTML(node: LayoutNode): string {
 		`Turn ${node.turn}${endedBadge}</span>` +
 		`<span style="font-size:9px;font-weight:bold;color:${node.color};">#${node.timelineNum}</span>` +
 		'</div>' +
-		// Teams
 		p1HTML +
 		p2HTML +
 		'</div></div>';
@@ -449,10 +416,8 @@ function verticalLineHTML(c: Connection): string {
 		`opacity:0.6;"></div>`;
 }
 
-/** Render a single axis-aligned dashed segment. */
 function dashedSegment(x1: number, y1: number, x2: number, y2: number, color: string): string {
 	if (x1 === x2) {
-		// vertical
 		const top = Math.min(y1, y2);
 		const h = Math.abs(y2 - y1);
 		if (h <= 0) return '';
@@ -460,7 +425,6 @@ function dashedSegment(x1: number, y1: number, x2: number, y2: number, color: st
 			`width:0;height:${h}px;border-left:2px dashed ${color};` +
 			`opacity:0.75;"></div>`;
 	} else {
-		// horizontal
 		const left = Math.min(x1, x2);
 		const w = Math.abs(x2 - x1);
 		if (w <= 0) return '';
@@ -482,7 +446,6 @@ function branchLineHTML(c: Connection): string {
 			);
 		}
 	} else {
-		// Fallback: straight rotated line (legacy)
 		const dx = c.x2 - c.x1;
 		const dy = c.y2 - c.y1;
 		const len = Math.sqrt(dx * dx + dy * dy);
@@ -493,7 +456,6 @@ function branchLineHTML(c: Connection): string {
 			`opacity:0.75;"></div>`;
 	}
 
-	// Origin dot on parent edge
 	const dot = `<div style="position:absolute;left:${c.x1 - 5}px;top:${c.y1 - 5}px;` +
 		`width:10px;height:10px;border-radius:50%;` +
 		`background:${c.dotColor || c.color};border:2px solid white;` +
@@ -533,7 +495,6 @@ export function generateTimelineHTML(data: {nodes: TimelineNodeData[]}): string 
 
 	const nodeHTML = layout.nodes.map(n => nodeCardHTML(n)).join('');
 
-	// Legend
 	const usedCols = [...new Set(layout.nodes.map(n => n.col))].sort((a, b) => a - b);
 	const legendItems = usedCols.map(c => {
 		const color = LANE_COLORS[c % LANE_COLORS.length];
@@ -553,14 +514,12 @@ export function generateTimelineHTML(data: {nodes: TimelineNodeData[]}): string 
 
 	return '<div style="margin:8px 0;padding:12px;border:2px solid #aaa;border-radius:6px;' +
 		'background:white;font-family:Arial,Helvetica,sans-serif;">' +
-		// Header bar
 		'<div style="display:flex;justify-content:space-between;align-items:center;' +
 		'margin-bottom:10px;padding-bottom:8px;border-bottom:2px solid #ddd;">' +
 		'<span style="font-weight:bold;font-size:14px;color:#333;">Timeline Map</span>' +
 		'<span style="font-size:11px;color:white;background:#4a90e2;padding:3px 10px;' +
 		`border-radius:4px;font-weight:bold;">${countLabel}</span>` +
 		'</div>' +
-		// Scrollable graph
 		'<div style="overflow:auto;max-height:520px;max-width:100%;' +
 		'-webkit-overflow-scrolling:touch;' +
 		'background:#fafafa;border:1px solid #e0e0e0;border-radius:4px;padding:4px;">' +
@@ -568,7 +527,6 @@ export function generateTimelineHTML(data: {nodes: TimelineNodeData[]}): string 
 		`height:${layout.height}px;min-width:${layout.width}px;">` +
 		connHTML + nodeHTML +
 		'</div></div>' +
-		// Legend
 		'<div style="display:flex;gap:16px;margin-top:10px;padding-top:8px;' +
 		'border-top:1px solid #ddd;flex-wrap:wrap;justify-content:center;' +
 		'font-size:11px;color:#666;">' +

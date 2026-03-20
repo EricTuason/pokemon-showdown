@@ -7,7 +7,31 @@
 
 const SP = 'https://play.pokemonshowdown.com/sprites';
 
-const NODE_W = 200;
+/**
+ * ── Node width budget ─────────────────────────────────────────────
+ * Computed once, statically. We do NOT measure at render time.
+ *
+ * Widest path through a node = one pokemon row, inside a side block,
+ * inside a node card (all with their own padding/borders/margins):
+ *
+ *   node border (current, worst case)   4 × 2  =   8
+ *   side-block horizontal margin        4 × 2  =   8
+ *   side-block border                   1 × 2  =   2
+ *   row horizontal padding              4 × 2  =   8
+ *   sprite <img>                                 =  20
+ *   sprite → name gap                            =   3
+ *   name text — 18 chars, 8px Arial bold
+ *     (≈5.8 px/char avg worst-case)     18 × 5.8 ≈ 105
+ *   status badge — 2px margin + 4px pad
+ *     + 3 glyphs @ 6px (≈12px)                   =  18
+ *   safety slack (anti-ellipsis)                 =   2
+ *   ─────────────────────────────────────────────────────
+ *   TOTAL                                        = 174
+ *
+ * Change any of the constituent constants below → re-check this sum.
+ */
+const NODE_W = 174;
+
 // Height scales with team size; base header + per-row height
 const HEADER_H = 28;
 const SIDE_LABEL_H = 14;
@@ -21,6 +45,13 @@ const NODE_H_BASE = HEADER_H + (SIDE_LABEL_H + SIDE_PAD * 2 + ROW_H * MAX_TEAM) 
 const GAP_X = 32;
 const GAP_Y = 24;
 const PAD  = 28;
+
+/**
+ * Fixed HP-bar width, expressed in px so it never varies with the
+ * surrounding text. 64px ≈ 8 × an 'm' at the row's 8-px font.
+ * Tweak this single knob to resize every bar.
+ */
+const HP_BAR_PX = 64;
 
 const LANE_COLORS = [
 	'#70a0ff', '#b090ff', '#70e080', '#f0d070',
@@ -289,7 +320,9 @@ function gen5Sprite(speciesId: string): string {
 
 /**
  * Renders a single pokemon row inside a side block.
- * Layout: [sprite 20x15] [name/status] [HP bar]
+ * Layout:
+ *   [sprite 20×15]  [ name + status badge
+ *                     HP bar (fixed width, directly below name) ]
  */
 function pokeRowHTML(poke: PokemonSnapshot): string {
 	const fainted = poke.fainted || poke.hp <= 0;
@@ -317,14 +350,15 @@ function pokeRowHTML(poke: PokemonSnapshot): string {
 		// Sprite
 		`<img src="${gen5Sprite(poke.species)}" width="20" height="15" ` +
 		`style="image-rendering:pixelated;flex-shrink:0;${imgStyle}" />` +
-		// Name + status
+		// Name-block (name on top, fixed-width HP bar beneath)
 		'<div style="flex:1;min-width:0;margin-left:3px;">' +
+		// name line
 		`<div style="font-size:8px;font-weight:${poke.isActive ? 'bold' : 'normal'};` +
 		`${nameStyle}overflow:hidden;text-overflow:ellipsis;white-space:nowrap;` +
 		`line-height:11px;">${poke.name}${statusBadge}</div>` +
-		// HP bar
-		'<div style="width:100%;height:3px;background:#e0e0e0;border-radius:2px;' +
-		'overflow:hidden;margin-top:1px;">' +
+		// HP bar — fixed px width, independent of name length
+		`<div style="width:${HP_BAR_PX}px;height:3px;background:#e0e0e0;` +
+		'border-radius:2px;overflow:hidden;margin-top:1px;">' +
 		`<div style="width:${fainted ? 0 : poke.hp}%;height:100%;background:${hpColor};` +
 		`border-radius:2px;transition:width 0.3s;"></div>` +
 		'</div>' +
@@ -486,11 +520,12 @@ export function generateTimelineHTML(data: {nodes: TimelineNodeData[]}): string 
 	}
 
 	const timelineCount = new Set(nodes.map(n => n.timelineId)).size;
-	const maxTurn = Math.max(...nodes.map(n => n.turn));
 	const currentNode = layout.nodes.find(n => n.isCurrent);
-	const countLabel = `${timelineCount} timeline${timelineCount !== 1 ? 's' : ''}` +
-		` \u00b7 ${maxTurn} turn${maxTurn !== 1 ? 's' : ''}` +
-		(currentNode ? ` \u00b7 Active: #${currentNode.timelineNum}` : '');
+	const countLabel =
+		`${timelineCount} Timeline${timelineCount !== 1 ? 's' : ''}` +
+		(currentNode
+			? ` \u2014 Present Timeline: #${currentNode.timelineNum}`
+			: '');
 
 	const connHTML = layout.connections.map(c =>
 		c.type === 'vertical' ? verticalLineHTML(c) : branchLineHTML(c)

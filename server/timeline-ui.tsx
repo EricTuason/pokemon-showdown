@@ -32,6 +32,13 @@ const SIDE_LABEL_H = 14;
 const ROW_H = 22;
 const SIDE_PAD = 4;
 const MAX_TEAM = 6;
+
+/**
+ * Baseline node height for a 2-player, 6-mon-per-side node.
+ * Used only as a defensive fallback in rowMaxH lookups — real heights
+ * are computed per-node from whatever sides are actually present.
+ * FFA nodes (4 sides) will be taller than this.
+ */
 const NODE_H_BASE = HEADER_H + (SIDE_LABEL_H + SIDE_PAD * 2 + ROW_H * MAX_TEAM) * 2 + 8;
 
 const GAP_X = 32;
@@ -45,6 +52,18 @@ const LANE_COLORS = [
 	'#70a0ff', '#b090ff', '#70e080', '#f0d070',
 	'#ff7088', '#70d0e0', '#ffa070', '#f0a0c0',
 ];
+
+/**
+ * Per-player block border colors. P1 is special-cased to use the
+ * timeline's lane color (see collectSides) so its block visually ties
+ * to the timeline column — preserves the existing 2-player look.
+ * P2–P4 get fixed colors so players are identifiable across timelines.
+ */
+const SIDE_COLORS = {
+	p2: '#e07070',
+	p3: '#60b060',
+	p4: '#c09040',
+};
 
 const CURRENT_COLOR = '#111111';
 const CURRENT_GLOW  = 'rgba(0,0,0,0.35)';
@@ -70,11 +89,26 @@ export interface TimelineNodeData {
 	ended: boolean;
 	p1Team: PokemonSnapshot[];
 	p2Team: PokemonSnapshot[];
+	/** Present only for FFA/multi formats. Absent → 2-player node. */
+	p3Team?: PokemonSnapshot[];
+	/** Present only for FFA/multi formats. Absent → 2-player node. */
+	p4Team?: PokemonSnapshot[];
 	/** @deprecated */ p1Active?: PokemonSnapshot | null;
 	/** @deprecated */ p2Active?: PokemonSnapshot | null;
 }
 
 // ── Internal layout types ───────────────────────────────
+
+/**
+ * One side-block within a node card. `sides` on LayoutNode holds 2–4
+ * of these depending on format, so the render path doesn't need to
+ * know or care how many players there are.
+ */
+interface SideBlock {
+	label: string;
+	team: PokemonSnapshot[];
+	color: string;
+}
 
 interface LayoutNode {
 	timelineId: string;
@@ -93,8 +127,8 @@ interface LayoutNode {
 	branchFromCol: number | null;
 	branchFromRow: number | null;
 	branchLabel: string | null;
-	p1Team: PokemonSnapshot[];
-	p2Team: PokemonSnapshot[];
+	/** 2 entries for singles/doubles, 4 for FFA/multi. */
+	sides: SideBlock[];
 }
 
 interface Connection {
@@ -108,11 +142,43 @@ interface Connection {
 
 // ── Helpers ─────────────────────────────────────────────
 
-function computeNodeH(p1Team: PokemonSnapshot[], p2Team: PokemonSnapshot[]): number {
-	const p1Rows = Math.max(p1Team.length, 1);
-	const p2Rows = Math.max(p2Team.length, 1);
+/**
+ * Gathers whichever sides exist on this node into a uniform array.
+ * p1/p2 are always included (even if empty — they render as a '—' row)
+ * to keep 2-player node shape stable. p3/p4 are only included when the
+ * server sent them, so 2-player nodes stay the same height as before.
+ *
+ * P1's block color is the timeline's lane color — ties it visually to
+ * the column. P2–P4 use fixed player colors so you can track "which
+ * one is player 3" across different timelines.
+ */
+function collectSides(d: TimelineNodeData, laneColor: string): SideBlock[] {
+	const out: SideBlock[] = [];
+
+	// p1/p2: always present; honor deprecated single-active fallback
+	const p1 = d.p1Team?.length ? d.p1Team : (d.p1Active ? [d.p1Active] : []);
+	const p2 = d.p2Team?.length ? d.p2Team : (d.p2Active ? [d.p2Active] : []);
+	out.push({label: 'P1', team: p1, color: laneColor});
+	out.push({label: 'P2', team: p2, color: SIDE_COLORS.p2});
+
+	// p3/p4: only when the server sent them (FFA/multi)
+	if (d.p3Team) out.push({label: 'P3', team: d.p3Team, color: SIDE_COLORS.p3});
+	if (d.p4Team) out.push({label: 'P4', team: d.p4Team, color: SIDE_COLORS.p4});
+
+	return out;
+}
+
+/**
+ * Sums side-block heights. Variable-length input means 2-player nodes
+ * compute the same value as before, FFA nodes are just taller.
+ */
+function computeNodeH(sides: SideBlock[]): number {
 	const sideH = (rows: number) => SIDE_LABEL_H + SIDE_PAD * 2 + rows * ROW_H;
-	return HEADER_H + sideH(p1Rows) + sideH(p2Rows) + 8;
+	let total = HEADER_H + 8;
+	for (const s of sides) {
+		total += sideH(Math.max(s.team.length, 1));
+	}
+	return total;
 }
 
 // ── Layout computation ──────────────────────────────────
@@ -153,13 +219,20 @@ function computeLayout(data: TimelineNodeData[]): {
 	}
 	for (const arr of grouped.values()) arr.sort((a, b) => a.turn - b.turn);
 
+	// Pre-compute row heights. Has to happen before node placement
+	// because every node in a row sits at the same Y, determined by the
+	// tallest node in that row. With FFA nodes in the mix, rows can be
+	// mixed-height across timelines (a 2p branch next to a 4p branch)
+	// — each node still computes its own nodeH for the card, but its Y
+	// offset comes from the row's maximum.
 	const rowMaxH = new Map<number, number>();
-	for (const [, tlNodes] of grouped) {
+	for (const [tlId, tlNodes] of grouped) {
+		const col = colFor.get(tlId) || 0;
+		const laneColor = LANE_COLORS[col % LANE_COLORS.length];
 		for (const d of tlNodes) {
 			const row = rowFor.get(d.turn) || 0;
-			const p1Team = d.p1Team?.length ? d.p1Team : (d.p1Active ? [d.p1Active] : []);
-			const p2Team = d.p2Team?.length ? d.p2Team : (d.p2Active ? [d.p2Active] : []);
-			const h = computeNodeH(p1Team, p2Team);
+			const sides = collectSides(d, laneColor);
+			const h = computeNodeH(sides);
 			rowMaxH.set(row, Math.max(rowMaxH.get(row) || 0, h));
 		}
 	}
@@ -184,9 +257,8 @@ function computeLayout(data: TimelineNodeData[]): {
 			const isFirst = idx === 0;
 			const isBranch = isFirst && parentTlId !== null;
 
-			const p1Team = d.p1Team?.length ? d.p1Team : (d.p1Active ? [d.p1Active] : []);
-			const p2Team = d.p2Team?.length ? d.p2Team : (d.p2Active ? [d.p2Active] : []);
-			const nodeH = computeNodeH(p1Team, p2Team);
+			const sides = collectSides(d, color);
+			const nodeH = computeNodeH(sides);
 
 			let branchFromCol: number | null = null;
 			let branchFromRow: number | null = null;
@@ -207,7 +279,7 @@ function computeLayout(data: TimelineNodeData[]): {
 				color, isCurrent: d.isCurrent, ended: d.ended,
 				isFirst, isBranch,
 				branchFromCol, branchFromRow, branchLabel,
-				p1Team, p2Team,
+				sides,
 			});
 		});
 	}
@@ -384,8 +456,12 @@ function nodeCardHTML(node: LayoutNode): string {
 		? '<span style="font-size:8px;color:#999;font-weight:normal;"> ended</span>'
 		: '';
 
-	const p1HTML = sideBlockHTML(node.p1Team, 'P1', node.color);
-	const p2HTML = sideBlockHTML(node.p2Team, 'P2', '#e07070');
+	// Side blocks — however many there are. 2 for singles, 4 for FFA.
+	// sideBlockHTML already takes label/color as args so no change
+	// there; this just stops hardcoding which two to draw.
+	const sideBlocks = node.sides
+		.map(s => sideBlockHTML(s.team, s.label, s.color))
+		.join('');
 
 	return `<div style="position:absolute;left:${node.x}px;top:${node.y}px;` +
 		`width:${NODE_W}px;height:${node.nodeH}px;` +
@@ -403,8 +479,7 @@ function nodeCardHTML(node: LayoutNode): string {
 		`Turn ${node.turn}${endedBadge}</span>` +
 		`<span style="font-size:9px;font-weight:bold;color:${node.color};">#${node.timelineNum}</span>` +
 		'</div>' +
-		p1HTML +
-		p2HTML +
+		sideBlocks +
 		'</div></div>';
 }
 

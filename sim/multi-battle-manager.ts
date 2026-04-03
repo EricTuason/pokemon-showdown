@@ -17,12 +17,20 @@ import { Side } from './side';
 // Re-export PokemonSet for convenience
 export { PokemonSet };
 
+/** All valid battle side identifiers. FFA/multi formats use all 4; singles/doubles use p1/p2 only. */
+export type BattleSideID = 'p1' | 'p2' | 'p3' | 'p4';
+
+/** Side IDs in order, for iteration. */
+export const ALL_SIDE_IDS: readonly BattleSideID[] = ['p1', 'p2', 'p3', 'p4'] as const;
+
 // Types for battle options
 export interface MultiBattleOptions {
 	formatid?: string;
 	seed?: PRNGSeed;
 	p1?: PlayerOptions;
 	p2?: PlayerOptions;
+	p3?: PlayerOptions;   // NEW — optional, only used for 4-player formats
+	p4?: PlayerOptions;   // NEW
 	debug?: boolean;
 }
 
@@ -159,6 +167,8 @@ export interface BattleSnapshot {
 	winner: string | undefined;
 	p1: SideSnapshot;
 	p2: SideSnapshot;
+	p3?: SideSnapshot;
+	p4?: SideSnapshot;
 	field: FieldSnapshot;
 }
 
@@ -359,8 +369,28 @@ export class MultiBattleManager {
 			console.log(`[Timeline Team] Setting up p2 from createBattle options`);
 			this.setPlayer(battleId, 'p2', options.p2);
 		}
+		if (options.p3) {
+			console.log(`[Timeline Team] Setting up p3 from createBattle options`);
+			this.setPlayer(battleId, 'p3', options.p3);
+		}
+		if (options.p4) {
+			console.log(`[Timeline Team] Setting up p4 from createBattle options`);
+			this.setPlayer(battleId, 'p4', options.p4);
+		}
 
 		return battle;
+	}
+
+	/**
+	 * Returns the side IDs that actually exist in this battle.
+	 * 2-player formats → ['p1', 'p2']; FFA/multi → ['p1', 'p2', 'p3', 'p4'].
+	 */
+	private getSideIds(battle: Battle): BattleSideID[] {
+		const ids: BattleSideID[] = [];
+		for (const side of battle.sides) {
+			if (side) ids.push(side.id as BattleSideID);
+		}
+		return ids;
 	}
 
 	/**
@@ -473,7 +503,7 @@ export class MultiBattleManager {
 	 * captured for transfer. Completely removes it from the team roster
 	 * rather than marking it as fainted.
 	 */
-	removePokemonAfterCapture(battleId: string, side: 'p1' | 'p2', position: number = 0): boolean {
+	removePokemonAfterCapture(battleId: string, side: BattleSideID, position: number = 0): boolean {
 		const battle = this.getBattle(battleId);
 		if (!battle) return false;
 		const battleSide = battle[side];
@@ -547,15 +577,16 @@ export class MultiBattleManager {
 	}
 
 	/**
-	 * Makes choices for both players (convenience method)
+	 * Makes choices for all players (convenience method).
+	 * For 2-player: makeChoices(id, p1, p2)
+	 * For 4-player: makeChoices(id, p1, p2, p3, p4)
 	 */
-	makeChoices(battleId: string, p1Choice: string, p2Choice: string): void {
-		console.log(`[Timeline Team] makeChoices("${battleId}", "${p1Choice}", "${p2Choice}")`);
+	makeChoices(battleId: string, ...choices: string[]): void {
+		console.log(`[Timeline Team] makeChoices("${battleId}", ${choices.map(c => `"${c}"`).join(', ')})`);
 		const battle = this.getBattle(battleId);
-		if (!battle) {
-			throw new Error(`Battle "${battleId}" not found`);
-		}
-		battle.makeChoices(p1Choice, p2Choice);
+		if (!battle) throw new Error(`Battle "${battleId}" not found`);
+		// Battle.makeChoices already accepts variadic args in PS
+		battle.makeChoices(...choices);
 	}
 
 	/**
@@ -895,7 +926,7 @@ export class MultiBattleManager {
 	 */
 	restoreSideConditions(
 		battleId: string,
-		sideId: 'p1' | 'p2',
+		sideId: BattleSideID,
 		conditions: SideConditionSnapshot[] | null
 	): boolean {
 		const battle = this.getBattle(battleId);
@@ -985,7 +1016,7 @@ export class MultiBattleManager {
 	 */
 	restoreSlotConditions(
 		battleId: string,
-		sideId: 'p1' | 'p2',
+		sideId: BattleSideID,
 		slotConditions: { [slot: number]: SlotConditionSnapshot[] } | null
 	): boolean {
 		const battle = this.getBattle(battleId);
@@ -1051,26 +1082,14 @@ export class MultiBattleManager {
 	}
 
 	/**
-	 * Walks the field and side-condition EffectStates and re-resolves their
-	 * `source` references against the CURRENT team roster.
-	 *
-	 * restoreField and restoreSideConditions must run before team rebuild
-	 * (so entry hazards are in place when switchIn fires), which means
-	 * findPokemonByName can't resolve source names at that point — the
-	 * roster is the torn-down / pre-rebuild one. This method runs AFTER
-	 * team rebuild to patch the references.
-	 *
-	 * Source names come from the snapshot passed in, not from the
-	 * EffectState (which was deliberately left with source: null).
-	 *
-	 * Slot conditions don't need this — restoreSlotConditions already runs
-	 * post-rebuild and resolves source correctly on its own.
+	 * Walks field and side-condition EffectStates, re-resolving `source` refs
+	 * against the current roster. Accepts a map of sideId → conditions so it
+	 * scales to any player count.
 	 */
 	reconnectConditionSources(
 		battleId: string,
 		fieldSnap: FieldSnapshot | null,
-		p1SideConds: SideConditionSnapshot[] | null,
-		p2SideConds: SideConditionSnapshot[] | null,
+		sideCondsBySide: Partial<Record<BattleSideID, SideConditionSnapshot[] | null>>,
 	): void {
 		const battle = this.getBattle(battleId);
 		if (!battle) return;
@@ -1078,46 +1097,29 @@ export class MultiBattleManager {
 		console.log(`[Timeline Restore] reconnectConditionSources("${battleId}")`);
 		let patched = 0;
 
-		// ── Field ──
+		// ── Field ── (unchanged from before)
 		if (fieldSnap) {
 			if (fieldSnap.weather?.source && battle.field.weather) {
 				const src = this.findPokemonByName(battle, fieldSnap.weather.source);
-				if (src) {
-					battle.field.weatherState.source = src;
-					patched++;
-					console.log(`[Timeline Restore]   Weather source → ${src.name}`);
-				} else {
-					console.log(`[Timeline Restore]   Weather source "${fieldSnap.weather.source}" not in rebuilt roster`);
-				}
+				if (src) { battle.field.weatherState.source = src; patched++; }
 			}
 			if (fieldSnap.terrain?.source && battle.field.terrain) {
 				const src = this.findPokemonByName(battle, fieldSnap.terrain.source);
-				if (src) {
-					battle.field.terrainState.source = src;
-					patched++;
-					console.log(`[Timeline Restore]   Terrain source → ${src.name}`);
-				} else {
-					console.log(`[Timeline Restore]   Terrain source "${fieldSnap.terrain.source}" not in rebuilt roster`);
-				}
+				if (src) { battle.field.terrainState.source = src; patched++; }
 			}
 			for (const pw of fieldSnap.pseudoWeather) {
 				if (!pw.source || !battle.field.pseudoWeather[pw.id]) continue;
 				const src = this.findPokemonByName(battle, pw.source);
-				if (src) {
-					battle.field.pseudoWeather[pw.id].source = src;
-					patched++;
-					console.log(`[Timeline Restore]   PseudoWeather ${pw.id} source → ${src.name}`);
-				} else {
-					console.log(`[Timeline Restore]   PseudoWeather ${pw.id} source "${pw.source}" not in rebuilt roster`);
-				}
+				if (src) { battle.field.pseudoWeather[pw.id].source = src; patched++; }
 			}
 		}
 
-		// ── Side conditions ──
-		const reconnectSide = (sideId: 'p1' | 'p2', conds: SideConditionSnapshot[] | null) => {
-			if (!conds) return;
+		// ── Side conditions — iterate whatever sides were passed in ──
+		for (const sideId of ALL_SIDE_IDS) {
+			const conds = sideCondsBySide[sideId];
+			if (!conds) continue;
 			const side = battle[sideId];
-			if (!side) return;
+			if (!side) continue;
 			for (const cond of conds) {
 				if (!cond.source || !side.sideConditions[cond.id]) continue;
 				const src = this.findPokemonByName(battle, cond.source);
@@ -1125,13 +1127,9 @@ export class MultiBattleManager {
 					side.sideConditions[cond.id].source = src;
 					patched++;
 					console.log(`[Timeline Restore]   ${sideId} ${cond.id} source → ${src.name}`);
-				} else {
-					console.log(`[Timeline Restore]   ${sideId} ${cond.id} source "${cond.source}" not in rebuilt roster`);
 				}
 			}
-		};
-		reconnectSide('p1', p1SideConds);
-		reconnectSide('p2', p2SideConds);
+		}
 
 		console.log(`[Timeline Restore]   Reconnected ${patched} source reference(s)`);
 	}
@@ -1142,7 +1140,7 @@ export class MultiBattleManager {
 	 */
 	extractPokemon(
 		battleId: string,
-		side: 'p1' | 'p2',
+		side: BattleSideID,
 		position: number = 0
 	): { success: boolean; state?: PokemonTransferState; error?: string } {
 		console.log(`[Timeline Team] extractPokemon("${battleId}", "${side}", ${position})`);
@@ -1204,7 +1202,7 @@ export class MultiBattleManager {
 	 */
 	receivePokemon(
 		battleId: string,
-		side: 'p1' | 'p2',
+		side: BattleSideID,
 		state: PokemonTransferState,
 		switchIn: boolean = true
 	): TransferResult {
@@ -1287,7 +1285,7 @@ export class MultiBattleManager {
 	 * Gets the Pokemon's transfer state without removing it from battle
 	 * Useful for inspecting what would be transferred
 	 */
-	getPokemonTransferState(battleId: string, side: 'p1' | 'p2', position: number = 0): PokemonTransferState | null {
+	getPokemonTransferState(battleId: string, side: BattleSideID, position: number = 0): PokemonTransferState | null {
 		console.log(`[Timeline Team] getPokemonTransferState("${battleId}", "${side}", ${position})`);
 
 		const battle = this.getBattle(battleId);
@@ -1316,10 +1314,10 @@ export class MultiBattleManager {
 	 */
 	transferPokemon(
 		sourceBattleId: string,
-		sourceSide: 'p1' | 'p2',
+		sourceSide: BattleSideID,
 		sourcePosition: number,
 		destBattleId: string,
-		destSide: 'p1' | 'p2',
+		destSide: BattleSideID,
 		switchIn: boolean = true
 	): TransferResult {
 		console.log(`[Timeline Team] transferPokemon START`);
@@ -1351,7 +1349,7 @@ export class MultiBattleManager {
 	/**
 	 * Forces a switch in a battle (useful after extracting a Pokemon)
 	 */
-	forceSwitch(battleId: string, side: 'p1' | 'p2', benchPosition: number): boolean {
+	forceSwitch(battleId: string, side: BattleSideID, benchPosition: number): boolean {
 		console.log(`[Timeline Team] forceSwitch("${battleId}", "${side}", ${benchPosition})`);
 
 		const battle = this.getBattle(battleId);
@@ -1543,7 +1541,7 @@ export class MultiBattleManager {
 
 		const fieldSnapshot = this.getFieldSnapshot(battle);
 
-		const snapshot = {
+		const snapshot: BattleSnapshot = {
 			battleId,
 			turn: battle.turn,
 			ended: battle.ended,
@@ -1552,6 +1550,14 @@ export class MultiBattleManager {
 			p2: getSideSnapshot(battle.p2),
 			field: fieldSnapshot,
 		};
+
+		// Only populate p3/p4 if the battle actually has them
+		if (battle.sides.length > 2 && battle.p3) {
+			snapshot.p3 = getSideSnapshot(battle.p3);
+		}
+		if (battle.sides.length > 3 && battle.p4) {
+			snapshot.p4 = getSideSnapshot(battle.p4);
+		}
 
 		console.log(`[Timeline Team] getSnapshot result - turn ${snapshot.turn}, ended: ${snapshot.ended}`);
 		console.log(`[Timeline Team]   p1 team: [${snapshot.p1.team.map(p => `${p.name}(${p.hp}%)`).join(', ')}]`);
@@ -1606,7 +1612,7 @@ export class MultiBattleManager {
 	/**
 	 * Gets a Pokemon from a battle's team
 	 */
-	getPokemon(battleId: string, side: 'p1' | 'p2', position: number): Pokemon | null {
+	getPokemon(battleId: string, side: BattleSideID, position: number): Pokemon | null {
 		console.log(`[Timeline Team] getPokemon("${battleId}", "${side}", ${position})`);
 
 		const battle = this.getBattle(battleId);
@@ -1623,7 +1629,7 @@ export class MultiBattleManager {
 	/**
 	 * Gets the active Pokemon from a battle
 	 */
-	getActivePokemon(battleId: string, side: 'p1' | 'p2', slot: number = 0): Pokemon | null {
+	getActivePokemon(battleId: string, side: BattleSideID, slot: number = 0): Pokemon | null {
 		console.log(`[Timeline Team] getActivePokemon("${battleId}", "${side}", ${slot})`);
 
 		const battle = this.getBattle(battleId);
@@ -1652,7 +1658,7 @@ export class MultiBattleManager {
 	 */
 	replaceTeamFromSnapshot(
 		battleId: string,
-		side: 'p1' | 'p2',
+		side: BattleSideID,
 		snapshotSets: PokemonSet[],
 		snapshotDisplays: PokemonSnapshot[],
 		transferredState: PokemonTransferState
@@ -1816,7 +1822,7 @@ export class MultiBattleManager {
 	 */
 	restoreTeamFromSnapshot(
 		battleId: string,
-		side: 'p1' | 'p2',
+		side: BattleSideID,
 		snapshotSets: PokemonSet[],
 		snapshotDisplays: PokemonSnapshot[]
 	): TransferResult {

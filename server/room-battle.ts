@@ -1494,19 +1494,20 @@ export class RoomBattle extends RoomGame<RoomBattlePlayer> {
 		}
 
 		const buttons = validNodes.map(node => {
-			// Find active Pokemon from team arrays
-			const p1Active = node.p1Team?.find((p: any) => p.isActive && !p.fainted);
-			const p2Active = node.p2Team?.find((p: any) => p.isActive && !p.fainted);
-			const p1Name = p1Active?.name || 'Empty';
-			const p2Name = p2Active?.name || 'Empty';
-			const label = `Timeline #${node.timelineNum}, Turn ${node.turn} (${p1Name} vs ${p2Name})`;
+			// Build a list of active mons from whatever sides the node has
+			const actives: string[] = [];
+			for (const key of ['p1Team', 'p2Team', 'p3Team', 'p4Team'] as const) {
+				const team = node[key];
+				if (!team) continue;
+				const active = team.find((p: any) => p.isActive && !p.fainted);
+				actives.push(active?.name || '—');
+			}
+
+			const label = `Timeline #${node.timelineNum}, Turn ${node.turn} (${actives.join(' / ')})`;
 			const value = `${node.timelineId}|${node.turn}`;
 
 			return `<form data-submitsend="/msgroom ${this.roomid},/choose transfer|${value}">` +
-				`<button class="button" style="margin:4px;padding:8px 16px;` +
-				`background:#8844FF;color:white;border:none;border-radius:4px;` +
-				`font-weight:bold;font-size:12px;cursor:pointer;">` +
-				`${label}</button></form>`;
+				`<button class="button" style="...">${label}</button></form>`;
 		}).join('');
 
 		return '<div style="margin-top:8px;padding:12px;border:2px solid #8844FF;' +

@@ -15,6 +15,8 @@ import {
 	SideConditionSnapshot,
 	SlotConditionSnapshot,
 	VolatileSnapshot,
+	BattleSideID,
+	ALL_SIDE_IDS
 } from './multi-battle-manager';
 
 export interface TimelineNodeData {
@@ -27,25 +29,32 @@ export interface TimelineNodeData {
 	ended: boolean;
 	p1Team: PokemonSnapshotClient[];
 	p2Team: PokemonSnapshotClient[];
+	p3Team?: PokemonSnapshotClient[];            // NEW
+	p4Team?: PokemonSnapshotClient[];            // NEW
 	p1SideConditions: SideConditionSnapshot[];
 	p2SideConditions: SideConditionSnapshot[];
+	p3SideConditions?: SideConditionSnapshot[];  // NEW
+	p4SideConditions?: SideConditionSnapshot[];  // NEW
 	field: FieldSnapshot;
 }
 
 /**
- * Shape of each entry in the turnSnapshots history maps.
- * Centralized here so the capture, clone, and branch-copy code paths
- * all agree on the structure.
+ * Per-side data stored in a turn snapshot. Grouped so the snapshot structure
+ * scales to any player count without adding 4 fields per side.
+ */
+type SideSnapshotData = {
+	team: PokemonSnapshot[];
+	sets: PokemonSet[];
+	sideConditions: SideConditionSnapshot[];
+	slotConditions: { [slot: number]: SlotConditionSnapshot[] };
+};
+
+/**
+ * One entry in a timeline's turn-history map. `sides` holds only the sides
+ * that existed when the snapshot was taken — p3/p4 are absent for 2-player.
  */
 type TurnSnapshotEntry = {
-	p1Team: PokemonSnapshot[];
-	p2Team: PokemonSnapshot[];
-	p1Sets: PokemonSet[];
-	p2Sets: PokemonSet[];
-	p1SideConditions: SideConditionSnapshot[];
-	p2SideConditions: SideConditionSnapshot[];
-	p1SlotConditions: { [slot: number]: SlotConditionSnapshot[] };
-	p2SlotConditions: { [slot: number]: SlotConditionSnapshot[] };
+	sides: Partial<Record<BattleSideID, SideSnapshotData>>;
 	field: FieldSnapshot;
 };
 
@@ -443,19 +452,26 @@ function deepCloneSlotConditions(
 	return out;
 }
 
+function deepCloneSideSnapshotData(d: SideSnapshotData): SideSnapshotData {
+	return {
+		team: d.team.map(deepCloneSnapshot),
+		sets: d.sets.map(deepCloneSet),
+		sideConditions: deepCloneSideConditions(d.sideConditions),
+		slotConditions: deepCloneSlotConditions(d.slotConditions),
+	};
+}
+
 /**
  * Deep-clones a full turn snapshot entry.
  */
 function deepCloneTurnSnapshot(snap: TurnSnapshotEntry): TurnSnapshotEntry {
+	const sides: Partial<Record<BattleSideID, SideSnapshotData>> = {};
+	for (const sideId of ALL_SIDE_IDS) {
+		const data = snap.sides[sideId];
+		if (data) sides[sideId] = deepCloneSideSnapshotData(data);
+	}
 	return {
-		p1Team: snap.p1Team.map(deepCloneSnapshot),
-		p2Team: snap.p2Team.map(deepCloneSnapshot),
-		p1Sets: snap.p1Sets.map(deepCloneSet),
-		p2Sets: snap.p2Sets.map(deepCloneSet),
-		p1SideConditions: deepCloneSideConditions(snap.p1SideConditions),
-		p2SideConditions: deepCloneSideConditions(snap.p2SideConditions),
-		p1SlotConditions: deepCloneSlotConditions(snap.p1SlotConditions),
-		p2SlotConditions: deepCloneSlotConditions(snap.p2SlotConditions),
+		sides,
 		field: deepCloneFieldSnapshot(snap.field),
 	};
 }
@@ -544,37 +560,34 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 		}
 		const history = this.turnSnapshots.get(timelineId)!;
 
-		const p1Side = battle.sides?.[0] ?? null;
-		const p2Side = battle.sides?.[1] ?? null;
+		const sides: Partial<Record<BattleSideID, SideSnapshotData>> = {};
+		let anyTeam = false;
 
-		const p1Team = extractTeamSnapshot(p1Side);
-		const p2Team = extractTeamSnapshot(p2Side);
-		const p1Sets = extractTeamSets(p1Side);
-		const p2Sets = extractTeamSets(p2Side);
-		const p1SideConditions = extractSideConditions(p1Side);
-		const p2SideConditions = extractSideConditions(p2Side);
-		const p1SlotConditions = extractSlotConditions(p1Side);
-		const p2SlotConditions = extractSlotConditions(p2Side);
+		// Iterate over whatever sides this battle actually has.
+		// battle.sides is [p1, p2] for singles, [p1, p2, p3, p4] for FFA.
+		for (const battleSide of (battle.sides ?? [])) {
+			if (!battleSide) continue;
+			const sideId = battleSide.id as BattleSideID;
+
+			const team = extractTeamSnapshot(battleSide);
+			const sets = extractTeamSets(battleSide);
+			const sideConditions = extractSideConditions(battleSide);
+			const slotConditions = extractSlotConditions(battleSide);
+
+			if (team.length > 0) anyTeam = true;
+
+			sides[sideId] = { team, sets, sideConditions, slotConditions };
+
+			console.log(`[Timeline Snapshot]   ${sideId} team: ${team.length}, conditions: [${sideConditions.map(c => c.id).join(', ')}]`);
+		}
+
 		const field = extractFieldSnapshot(battle);
 
-		console.log(`[Timeline Snapshot] Capturing turn ${turn} for ${timelineId}`);
-		console.log(`[Timeline Snapshot]   p1 team: ${p1Team.length}, p2 team: ${p2Team.length}`);
-		console.log(`[Timeline Snapshot]   p1 conditions: [${p1SideConditions.map(c => c.id).join(', ')}]`);
-		console.log(`[Timeline Snapshot]   p2 conditions: [${p2SideConditions.map(c => c.id).join(', ')}]`);
-		console.log(`[Timeline Snapshot]   field: weather=${field.weather?.id || 'none'}, terrain=${field.terrain?.id || 'none'}, pseudoWeather=[${field.pseudoWeather.map(pw => pw.id).join(', ')}]`);
+		console.log(`[Timeline Snapshot] Capturing turn ${turn} for ${timelineId} (${Object.keys(sides).length} sides)`);
+		console.log(`[Timeline Snapshot]   field: weather=${field.weather?.id || 'none'}, terrain=${field.terrain?.id || 'none'}`);
 
-		if (p1Team.length > 0 || p2Team.length > 0) {
-			history.set(turn, {
-				p1Team,
-				p2Team,
-				p1Sets,
-				p2Sets,
-				p1SideConditions,
-				p2SideConditions,
-				p1SlotConditions,
-				p2SlotConditions,
-				field,
-			});
+		if (anyTeam) {
+			history.set(turn, { sides, field });
 		}
 	}
 
@@ -681,7 +694,7 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 				continue;
 			}
 
-			const side = sourceBattle[transfer.sideId as 'p1' | 'p2'];
+			const side = sourceBattle[transfer.sideId as BattleSideID];
 			const activePokemon = side?.active?.[0];
 
 			if (!activePokemon || activePokemon.fainted || activePokemon.hp <= 0) {
@@ -768,127 +781,86 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 
 		for (const t of transfers) {
 			if (t.sourceBattleId !== sourceBattleId) {
-				throw new Error(
-					`Transfer group: mismatched source battles ("${t.sourceBattleId}" vs "${sourceBattleId}")`
-				);
+				throw new Error(`Transfer group: mismatched source battles`);
 			}
 		}
 
 		const resolvedTargetId = this.resolveManagerBattleId(targetGlobalId);
 		if (!resolvedTargetId) {
-			throw new Error(`Target battle "${targetGlobalId}" not found in manager`);
+			throw new Error(`Target battle "${targetGlobalId}" not found`);
 		}
 
-		const transferringSides = new Set(transfers.map(t => t.sideId as 'p1' | 'p2'));
-		const allSides: ('p1' | 'p2')[] = ['p1', 'p2'];
+		// ── Derive sides from the actual battle instead of hardcoding ──
+		const sourceBattle = this.manager.getBattle(sourceBattleId);
+		if (!sourceBattle) throw new Error(`Source battle not found`);
+		const allSides: BattleSideID[] = sourceBattle.sides
+			.filter((s: any) => s)
+			.map((s: any) => s.id as BattleSideID);
 
-		// ── Step 1: Capture all transfer states before modifying anything ──
-		const capturedStates = new Map<'p1' | 'p2', PokemonTransferState>();
+		const transferringSides = new Set<BattleSideID>(
+			transfers.map(t => t.sideId as BattleSideID)
+		);
+
+		// ── Step 1: Capture ──
+		const capturedStates = new Map<BattleSideID, PokemonTransferState>();
 		for (const transfer of transfers) {
-			const side = transfer.sideId as 'p1' | 'p2';
+			const side = transfer.sideId as BattleSideID;
 			const state = this.manager.getPokemonTransferState(sourceBattleId, side, 0);
-			if (!state) {
-				throw new Error(`No active Pokemon to transfer for ${side}`);
-			}
+			if (!state) throw new Error(`No active Pokemon to transfer for ${side}`);
 			capturedStates.set(side, state);
-			console.log(`[TIMELINE DEBUG] Captured ${side}: ${state.set.name || state.set.species}`);
 		}
 
-		// ── Step 2: Remove transferred Pokémon from the live battle ──
+		// ── Step 2: Remove ──
 		for (const side of transferringSides) {
 			this.manager.removePokemonAfterCapture(sourceBattleId, side, 0);
-			console.log(`[TIMELINE DEBUG] Removed ${side} active from live battle`);
 		}
 
-		// ── Step 3: Snapshot the source timeline post-removal ──
+		// ── Step 3: Snapshot source post-removal ──
 		const currentGlobalId = this.battle?.currentTimelineId || '';
 		if (currentGlobalId) {
-			const srcBattle = this.manager.getBattle(sourceBattleId);
-			if (srcBattle) {
-				this.captureSnapshot(currentGlobalId, srcBattle);
-				console.log(
-					`[TIMELINE DEBUG] Captured post-removal snapshot for ` +
-					`"${currentGlobalId}" at turn ${srcBattle.turn}`
-				);
-			}
+			const b = this.manager.getBattle(sourceBattleId);
+			if (b) this.captureSnapshot(currentGlobalId, b);
 		}
 
-		// ── Step 4: Restore field from the target turn ──
-		// Field is battle-scoped — restore once, not per-side.
-		// source refs are left null here; step 6b patches them.
+		// ── Step 4: Field ──
 		const targetField = this.getStoredField(targetGlobalId, targetTurn);
-		console.log(`[TIMELINE DEBUG] Restoring field from ${targetGlobalId} turn ${targetTurn}: weather=${targetField?.weather?.id || 'none'}, terrain=${targetField?.terrain?.id || 'none'}`);
 		this.manager.restoreField(sourceBattleId, targetField);
 
-		// ── Step 5: Restore both sides' side conditions ──
-		// Must complete for BOTH sides before any switchIn, so the transferred
-		// Pokemon sees the correct hazards when it enters. source refs left
-		// null; step 6b patches them.
-		const sideCondsBySide: { p1: SideConditionSnapshot[] | null; p2: SideConditionSnapshot[] | null } = {
-			p1: null, p2: null,
-		};
+		// ── Step 5: Side conditions — build a map for reconnection later ──
+		const sideCondsBySide: Partial<Record<BattleSideID, SideConditionSnapshot[] | null>> = {};
 		for (const side of allSides) {
 			const sideConds = this.getStoredSideConditions(targetGlobalId, targetTurn, side);
 			sideCondsBySide[side] = sideConds;
-			console.log(`[TIMELINE DEBUG] Restoring ${side} side conditions from ${targetGlobalId} turn ${targetTurn}: [${sideConds?.map(c => c.id).join(', ') || 'none'}]`);
 			this.manager.restoreSideConditions(sourceBattleId, side, sideConds);
 		}
 
-		// ── Step 6: Rebuild each side from the target turn's snapshot ──
+		// ── Step 6: Teams ──
 		for (const side of allSides) {
 			const snapshotSets = this.getStoredSets(targetGlobalId, targetTurn, side);
 			const snapshotDisplays = this.getStoredSnapshots(targetGlobalId, targetTurn, side);
 
 			if (transferringSides.has(side)) {
-				// Transferring side: replace team and inject captured Pokémon.
-				// Full switchIn → entry hazards trigger on the new arrival.
 				const transferredState = capturedStates.get(side)!;
-				console.log(`[TIMELINE DEBUG] Replacing team for ${side} (transferring)`);
 				const result = this.manager.replaceTeamFromSnapshot(
-					sourceBattleId,
-					side,
-					snapshotSets || [],
-					snapshotDisplays || [],
-					transferredState
+					sourceBattleId, side, snapshotSets || [], snapshotDisplays || [], transferredState
 				);
-				if (!result.success) {
-					throw new Error(`replaceTeamFromSnapshot failed for ${side}: ${result.error}`);
-				}
+				if (!result.success) throw new Error(`replaceTeamFromSnapshot failed for ${side}: ${result.error}`);
 			} else {
-				// Non-transferring side: pure restore, direct placement.
-				// No hazard re-trigger — the Pokemon was already there.
 				if (snapshotSets && snapshotSets.length > 0) {
-					console.log(`[TIMELINE DEBUG] Restoring team for ${side} (non-transferring)`);
-					const result = this.manager.restoreTeamFromSnapshot(
-						sourceBattleId,
-						side,
-						snapshotSets,
-						snapshotDisplays || []
+					this.manager.restoreTeamFromSnapshot(
+						sourceBattleId, side, snapshotSets, snapshotDisplays || []
 					);
-					if (!result.success) {
-						console.log(`[TIMELINE DEBUG] Warning: restoreTeamFromSnapshot failed for ${side}: ${result.error}`);
-					}
 				}
 			}
 		}
 
-		// ── Step 6b: Reconnect source refs on field & side conditions ──
-		// Teams are rebuilt; findPokemonByName can now resolve the source
-		// names captured in the snapshot against the correct roster.
-		this.manager.reconnectConditionSources(
-			sourceBattleId,
-			targetField,
-			sideCondsBySide.p1,
-			sideCondsBySide.p2,
-		);
+		// ── Step 6b: Reconnect — new map-based signature ──
+		this.manager.reconnectConditionSources(sourceBattleId, targetField, sideCondsBySide);
 
-		// ── Step 7: Restore slot conditions ──
-		// Team rebuild in step 6 cleared slotConditions to {}, so this runs
-		// after. source lookup works here since teams are already rebuilt.
+		// ── Step 7: Slot conditions ──
 		for (const side of allSides) {
 			const slotConds = this.getStoredSlotConditions(targetGlobalId, targetTurn, side);
 			if (slotConds && Object.keys(slotConds).length > 0) {
-				console.log(`[TIMELINE DEBUG] Restoring ${side} slot conditions from ${targetGlobalId} turn ${targetTurn}`);
 				this.manager.restoreSlotConditions(sourceBattleId, side, slotConds);
 			}
 		}
@@ -1144,27 +1116,31 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 		const presentTurn = this.getTimelineHeadTurn(presentId);
 		console.log(`[TIMELINE DEBUG] Present shift: ${this.battle.currentTimelineId} → ${presentId} @ turn ${presentTurn}`);
 
-		// Snapshot the outgoing timeline so it can be revisited later
+		// Snapshot outgoing timeline
 		const outgoingId = this.battle.currentTimelineId;
 		const outEntry = this.timelineRegistry.get(outgoingId);
 		const outBattle = outEntry ? this.manager.getBattle(outEntry.battleId) : null;
 		if (outBattle) this.captureSnapshot(outgoingId, outBattle);
 
-		// ── Field (once) — source refs patched post-rebuild ──
+		// ── Derive sides from the actual battle ──
+		const allSides: BattleSideID[] = battle.sides
+			.filter((s: any) => s)
+			.map((s: any) => s.id as BattleSideID);
+
+		// ── Field ──
 		const presentField = this.getStoredField(presentId, presentTurn);
-		console.log(`[TIMELINE DEBUG] Present-shift field: weather=${presentField?.weather?.id || 'none'}, terrain=${presentField?.terrain?.id || 'none'}`);
 		this.manager.restoreField(entry.battleId, presentField);
 
-		// ── Side conditions (both sides, before any placement) ──
-		const p1SideConds = this.getStoredSideConditions(presentId, presentTurn, 'p1');
-		const p2SideConds = this.getStoredSideConditions(presentId, presentTurn, 'p2');
-		console.log(`[TIMELINE DEBUG] Present-shift p1 conditions: [${p1SideConds?.map(c => c.id).join(', ') || 'none'}]`);
-		console.log(`[TIMELINE DEBUG] Present-shift p2 conditions: [${p2SideConds?.map(c => c.id).join(', ') || 'none'}]`);
-		this.manager.restoreSideConditions(entry.battleId, 'p1', p1SideConds);
-		this.manager.restoreSideConditions(entry.battleId, 'p2', p2SideConds);
+		// ── Side conditions ──
+		const sideCondsBySide: Partial<Record<BattleSideID, SideConditionSnapshot[] | null>> = {};
+		for (const side of allSides) {
+			const conds = this.getStoredSideConditions(presentId, presentTurn, side);
+			sideCondsBySide[side] = conds;
+			this.manager.restoreSideConditions(entry.battleId, side, conds);
+		}
 
-		// ── Teams (both sides use direct placement) ──
-		for (const side of ['p1', 'p2'] as const) {
+		// ── Teams ──
+		for (const side of allSides) {
 			const sets = this.getStoredSets(presentId, presentTurn, side);
 			const displays = this.getStoredSnapshots(presentId, presentTurn, side);
 			if (sets?.length && displays?.length) {
@@ -1172,11 +1148,11 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 			}
 		}
 
-		// ── Reconnect source refs now that teams exist ──
-		this.manager.reconnectConditionSources(entry.battleId, presentField, p1SideConds, p2SideConds);
+		// ── Reconnect ──
+		this.manager.reconnectConditionSources(entry.battleId, presentField, sideCondsBySide);
 
-		// ── Slot conditions (after team rebuild cleared them) ──
-		for (const side of ['p1', 'p2'] as const) {
+		// ── Slot conditions ──
+		for (const side of allSides) {
 			const slotConds = this.getStoredSlotConditions(presentId, presentTurn, side);
 			if (slotConds && Object.keys(slotConds).length > 0) {
 				this.manager.restoreSlotConditions(entry.battleId, side, slotConds);
@@ -1184,7 +1160,6 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 		}
 
 		battle.turn = presentTurn;
-
 		this.battle.currentTimelineId = presentId;
 		this.battle.currentTimeline = { ...entry, battle };
 		this.hookBattleSend(presentId, battle);
@@ -1433,40 +1408,35 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 
 		const computedCurrentId = this.computePresentId();
 		const allNodes: TimelineNodeData[] = [];
-
 		const emptyField: FieldSnapshot = { weather: null, terrain: null, pseudoWeather: [] };
 
 		for (const [globalId, entry] of this.timelineRegistry) {
 			const battle = this.manager.getBattle(entry.battleId);
 			const history = this.turnSnapshots.get(globalId);
 			const ended = battle?.ended ?? false;
+			const parentGlobalId = entry.parentNum ? this.findGlobalIdByNum(entry.parentNum) : null;
 
 			if (!history || history.size === 0) {
-				console.log(`[Timeline Nodes] ${globalId}: no history, creating empty node`);
 				allNodes.push({
 					timelineId: globalId,
 					timelineNum: entry.num,
 					turn: battle?.turn ?? 0,
-					parentTimelineId: entry.parentNum ? this.findGlobalIdByNum(entry.parentNum) : null,
+					parentTimelineId: parentGlobalId,
 					branchTurn: entry.fromTurn,
 					isCurrent: computedCurrentId === globalId,
 					ended,
-					p1Team: [],
-					p2Team: [],
-					p1SideConditions: [],
-					p2SideConditions: [],
+					p1Team: [], p2Team: [],
+					p1SideConditions: [], p2SideConditions: [],
 					field: emptyField,
 				});
 				continue;
 			}
 
-			const parentGlobalId = entry.parentNum ? this.findGlobalIdByNum(entry.parentNum) : null;
 			let maxTurn = 0;
-			for (const [t] of history) { if (t > maxTurn) maxTurn = t; }
+			for (const t of history.keys()) if (t > maxTurn) maxTurn = t;
 
 			for (const [turn, snap] of history) {
-				console.log(`[Timeline Nodes] ${globalId} turn ${turn}: p1 conditions=[${snap.p1SideConditions.map(c => c.id).join(', ')}], field weather=${snap.field.weather?.id || 'none'}`);
-				allNodes.push({
+				const node: TimelineNodeData = {
 					timelineId: globalId,
 					timelineNum: entry.num,
 					turn,
@@ -1474,16 +1444,28 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 					branchTurn: entry.fromTurn,
 					isCurrent: computedCurrentId === globalId && turn === maxTurn,
 					ended,
-					p1Team: snap.p1Team.map(toClientSnapshot),
-					p2Team: snap.p2Team.map(toClientSnapshot),
-					p1SideConditions: snap.p1SideConditions,
-					p2SideConditions: snap.p2SideConditions,
+					// p1/p2 always present; fall back to empty for robustness
+					p1Team: (snap.sides.p1?.team ?? []).map(toClientSnapshot),
+					p2Team: (snap.sides.p2?.team ?? []).map(toClientSnapshot),
+					p1SideConditions: snap.sides.p1?.sideConditions ?? [],
+					p2SideConditions: snap.sides.p2?.sideConditions ?? [],
 					field: snap.field,
-				});
+				};
+				// Only attach p3/p4 if the snapshot has them — keeps 2-player
+				// payloads small and lets clients use `'p3Team' in node` to
+				// detect FFA.
+				if (snap.sides.p3) {
+					node.p3Team = snap.sides.p3.team.map(toClientSnapshot);
+					node.p3SideConditions = snap.sides.p3.sideConditions;
+				}
+				if (snap.sides.p4) {
+					node.p4Team = snap.sides.p4.team.map(toClientSnapshot);
+					node.p4SideConditions = snap.sides.p4.sideConditions;
+				}
+				allNodes.push(node);
 			}
 		}
 
-		console.log(`[Timeline Nodes] Generated ${allNodes.length} total nodes`);
 		return { nodes: allNodes };
 	}
 
@@ -1495,120 +1477,52 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 	}
 
 	/**
-	 * Retrieves stored PokemonSets for a timeline at a given turn.
-	 * Uses "closest turn ≤ requested" lookup.
-	 *
-	 * NOTE: The returned sets reflect whatever was in the live battle
-	 * when captureSnapshot was called for that turn. If a Pokémon was
-	 * removed before the snapshot was taken (e.g. via transfer), it
-	 * will already be absent — no caller-side filtering is needed.
+	 * Shared closest-turn lookup for all getStored* methods.
+	 * Returns the snapshot entry at the nearest turn <= requested, or null.
 	 */
-	getStoredSets(timelineId: string, turn: number, side: 'p1' | 'p2'): PokemonSet[] | null {
+	private lookupSnapshot(timelineId: string, turn: number): TurnSnapshotEntry | null {
 		const history = this.turnSnapshots.get(timelineId);
 		if (!history) return null;
 
 		let closestTurn = -1;
-		for (const [t] of history) {
+		for (const t of history.keys()) {
 			if (t <= turn && t > closestTurn) closestTurn = t;
 		}
 		if (closestTurn === -1) return null;
 
-		const snap = history.get(closestTurn)!;
-		const sets = side === 'p1' ? snap.p1Sets : snap.p2Sets;
-		console.log(`[Timeline Team] getStoredSets("${timelineId}", turn=${turn}, side=${side}) -> ${sets.length} sets from turn ${closestTurn}`);
+		return history.get(closestTurn)!;
+	}
+
+	getStoredSets(timelineId: string, turn: number, side: BattleSideID): PokemonSet[] | null {
+		const snap = this.lookupSnapshot(timelineId, turn);
+		const sets = snap?.sides[side]?.sets ?? null;
+		console.log(`[Timeline Team] getStoredSets("${timelineId}", turn=${turn}, side=${side}) -> ${sets?.length ?? 0} sets`);
 		return sets;
 	}
 
-	getStoredSnapshots(timelineId: string, turn: number, side: 'p1' | 'p2'): PokemonSnapshot[] | null {
-		const history = this.turnSnapshots.get(timelineId);
-		if (!history) return null;
-
-		let closestTurn = -1;
-		for (const [t] of history) {
-			if (t <= turn && t > closestTurn) closestTurn = t;
-		}
-		if (closestTurn === -1) return null;
-
-		const snap = history.get(closestTurn)!;
-		return side === 'p1' ? snap.p1Team : snap.p2Team;
+	getStoredSnapshots(timelineId: string, turn: number, side: BattleSideID): PokemonSnapshot[] | null {
+		const snap = this.lookupSnapshot(timelineId, turn);
+		return snap?.sides[side]?.team ?? null;
 	}
 
-	/**
-	 * Retrieves stored side conditions for a timeline at a given turn.
-	 */
-	getStoredSideConditions(timelineId: string, turn: number, side: 'p1' | 'p2'): SideConditionSnapshot[] | null {
-		const history = this.turnSnapshots.get(timelineId);
-		if (!history) {
-			console.log(`[Timeline Side] getStoredSideConditions: no history for ${timelineId}`);
-			return null;
-		}
-
-		let closestTurn = -1;
-		for (const [t] of history) {
-			if (t <= turn && t > closestTurn) closestTurn = t;
-		}
-		if (closestTurn === -1) {
-			console.log(`[Timeline Side] getStoredSideConditions: no turn <= ${turn} in history`);
-			return null;
-		}
-
-		const snap = history.get(closestTurn)!;
-		const conditions = side === 'p1' ? snap.p1SideConditions : snap.p2SideConditions;
-		console.log(`[Timeline Side] getStoredSideConditions("${timelineId}", turn=${turn}, side=${side}) -> ${conditions.length} conditions from turn ${closestTurn}`);
-		return conditions;
+	getStoredSideConditions(timelineId: string, turn: number, side: BattleSideID): SideConditionSnapshot[] | null {
+		const snap = this.lookupSnapshot(timelineId, turn);
+		const conds = snap?.sides[side]?.sideConditions ?? null;
+		console.log(`[Timeline Side] getStoredSideConditions("${timelineId}", turn=${turn}, side=${side}) -> ${conds?.length ?? 0} conditions`);
+		return conds;
 	}
 
-	/**
-	 * Retrieves stored slot conditions for a timeline at a given turn.
-	 */
 	getStoredSlotConditions(
-		timelineId: string,
-		turn: number,
-		side: 'p1' | 'p2'
+		timelineId: string, turn: number, side: BattleSideID
 	): { [slot: number]: SlotConditionSnapshot[] } | null {
-		const history = this.turnSnapshots.get(timelineId);
-		if (!history) {
-			console.log(`[Timeline Slot] getStoredSlotConditions: no history for ${timelineId}`);
-			return null;
-		}
-
-		let closestTurn = -1;
-		for (const [t] of history) {
-			if (t <= turn && t > closestTurn) closestTurn = t;
-		}
-		if (closestTurn === -1) {
-			console.log(`[Timeline Slot] getStoredSlotConditions: no turn <= ${turn} in history`);
-			return null;
-		}
-
-		const snap = history.get(closestTurn)!;
-		const slotConds = side === 'p1' ? snap.p1SlotConditions : snap.p2SlotConditions;
-		const count = Object.values(slotConds).reduce((sum, arr) => sum + arr.length, 0);
-		console.log(`[Timeline Slot] getStoredSlotConditions("${timelineId}", turn=${turn}, side=${side}) -> ${count} conditions from turn ${closestTurn}`);
-		return slotConds;
+		const snap = this.lookupSnapshot(timelineId, turn);
+		return snap?.sides[side]?.slotConditions ?? null;
 	}
 
-	/**
-	 * Retrieves stored field snapshot for a timeline at a given turn.
-	 */
 	getStoredField(timelineId: string, turn: number): FieldSnapshot | null {
-		const history = this.turnSnapshots.get(timelineId);
-		if (!history) {
-			console.log(`[Timeline Field] getStoredField: no history for ${timelineId}`);
-			return null;
-		}
-
-		let closestTurn = -1;
-		for (const [t] of history) {
-			if (t <= turn && t > closestTurn) closestTurn = t;
-		}
-		if (closestTurn === -1) {
-			console.log(`[Timeline Field] getStoredField: no turn <= ${turn} in history`);
-			return null;
-		}
-
-		const snap = history.get(closestTurn)!;
-		console.log(`[Timeline Field] getStoredField("${timelineId}", turn=${turn}) -> weather=${snap.field.weather?.id || 'none'}, terrain=${snap.field.terrain?.id || 'none'} from turn ${closestTurn}`);
+		const snap = this.lookupSnapshot(timelineId, turn);
+		if (!snap) return null;
+		console.log(`[Timeline Field] getStoredField("${timelineId}", turn=${turn}) -> weather=${snap.field.weather?.id || 'none'}`);
 		return snap.field;
 	}
 }

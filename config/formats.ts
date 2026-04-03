@@ -50,21 +50,31 @@ export const Formats: import('../sim/dex-formats').FormatList = [
 	{
 		name: "[Gen 9] OU Timeline",
 		mod: 'gen9',
-		timeline: true,  // ← NEW: enables timeline branching
+		timeline: true,
 		ruleset: ['Standard', 'Evasion Abilities Clause', 'Sleep Moves Clause', '!Sleep Clause Mod'],
 	},
 	{
 		name: "[Gen 9] National Dex Timeline",
 		mod: 'gen9',
-		timeline: true,  // ← NEW: enables timeline branching
+		timeline: true,
 		ruleset: ['Standard NatDex', 'Sleep Moves Clause', '!Sleep Clause Mod'],
 	},
 	{
 		name: "[Gen 9] FFA Timeline",
 		mod: 'gen9',
 		gameType: 'freeforall',
-		timeline: true,  // ← NEW: enables timeline branching
+		timeline: true,
 		ruleset: ['Standard NatDex', 'Sleep Moves Clause', '!Sleep Clause Mod'],
+	},
+	{
+		name: "[Gen 9] FFA Timeline Random Battle",
+		mod: 'gen9',
+		team: 'randomFFA',
+		gameType: 'freeforall',
+		tournamentShow: false,
+		rated: false,
+		timeline: true,
+		ruleset: ['Obtainable', 'Species Clause', 'HP Percentage Mod', 'Cancel Mod', 'Sleep Clause Mod', 'Illusion Level Mod'],
 	},
 	{
 		name: "[Gen 9] Random National Dex Timeline",

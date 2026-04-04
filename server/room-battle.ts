@@ -1480,7 +1480,9 @@ export class RoomBattle extends RoomGame<RoomBattlePlayer> {
 		// 1. Current turn (can't transfer to where you already are)
 		// 2. Empty slots (turn 0 or no active Pokémon on either side)
 		const validNodes = nodes.filter(node => {
-			if (node.isCurrent || node.turn <= 0) return false;
+			if (node.isCurrent) return false;
+			// Placeholder nodes have no team data — skip them
+			if (!node.p1Team?.length && !node.p2Team?.length) return false;
 			// Find active Pokemon from team arrays
 			const p1Active = node.p1Team?.find((p: any) => p.isActive && !p.fainted);
 			const p2Active = node.p2Team?.find((p: any) => p.isActive && !p.fainted);

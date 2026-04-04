@@ -553,7 +553,10 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 
 	private captureSnapshot(timelineId: string, battle: any) {
 		if (!battle) return;
-		const turn = battle.turn ?? 0;
+		const currentTurn = battle.turn ?? 0;
+
+		if (currentTurn < 1) return; // No snapshot before turn 1 completes
+    	const turn = currentTurn - 1;
 
 		if (!this.turnSnapshots.has(timelineId)) {
 			this.turnSnapshots.set(timelineId, new Map());
@@ -1056,20 +1059,18 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 
 	/** Each timeline's head turn — NOT battle.turn (which is shared). */
 	private getTimelineHeadTurn(globalId: string): number {
-		// The current timeline owns battle.turn
 		if (globalId === this.battle?.currentTimelineId) {
 			const entry = this.timelineRegistry.get(globalId);
 			const b = entry ? this.manager.getBattle(entry.battleId) : null;
 			if (b) return b.turn;
 		}
-		// Non-current timelines: use their snapshot history's max turn
+		// Snapshot keys are now completed turns; add 1 to get the playing turn
 		const history = this.turnSnapshots.get(globalId);
 		if (history && history.size > 0) {
 			let max = 0;
 			for (const t of history.keys()) if (t > max) max = t;
-			return max;
+			return max + 1;
 		}
-		// Newly-minted branch with no snapshot yet
 		const entry = this.timelineRegistry.get(globalId);
 		return entry?.fromTurn != null ? entry.fromTurn + 1 : 0;
 	}

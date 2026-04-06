@@ -13,6 +13,7 @@ import { Teams, PokemonSet } from './teams';
 import { PRNG, PRNGSeed } from './prng';
 import { Pokemon, EffectState } from './pokemon';
 import { Side } from './side';
+import { State } from './state';
 
 // Re-export PokemonSet for convenience
 export { PokemonSet };
@@ -767,6 +768,39 @@ export class MultiBattleManager {
 			}
 		}
 		return null;
+	}
+
+	/**
+	 * Replaces a managed battle with one deserialized from a complete
+	 * serialized state. The old battle is destroyed. The caller must
+	 * re-attach a send function to the returned battle.
+	 */
+	replaceBattleFromState(
+		battleId: string,
+		serialized: AnyObject,
+		send: (type: string, data: string | string[]) => void
+	): Battle {
+		const old = this.battles.get(battleId);
+		if (old) {
+			try { old.destroy(); } catch {}
+		}
+
+		// Deep-clone so deserialization doesn't mutate the stored snapshot
+		const cloned: AnyObject = JSON.parse(JSON.stringify(serialized));
+		// Provide an empty log if we stripped it during capture
+		if (!cloned.log) cloned.log = [];
+
+		const battle = State.deserializeBattle(cloned);
+		battle.send = send as any;
+
+		this.battles.set(battleId, battle);
+		this.battleLogs.set(battleId, []);
+
+		console.log(
+			`[Timeline Team] replaceBattleFromState: "${battleId}" ` +
+			`turn=${battle.turn}, sides=${battle.sides.length}`
+		);
+		return battle;
 	}
 
 	/**

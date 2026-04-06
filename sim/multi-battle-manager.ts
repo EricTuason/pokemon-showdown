@@ -772,26 +772,51 @@ export class MultiBattleManager {
 
 	/**
 	 * Replaces a managed battle with one deserialized from a complete
-	 * serialized state. The old battle is destroyed. The caller must
-	 * re-attach a send function to the returned battle.
+	 * serialized state. The old battle is destroyed. Returns null if
+	 * deserialization fails.
 	 */
 	replaceBattleFromState(
 		battleId: string,
 		serialized: AnyObject,
 		send: (type: string, data: string | string[]) => void
-	): Battle {
+	): Battle | null {
 		const old = this.battles.get(battleId);
 		if (old) {
 			try { old.destroy(); } catch {}
 		}
 
-		// Deep-clone so deserialization doesn't mutate the stored snapshot
 		const cloned: AnyObject = JSON.parse(JSON.stringify(serialized));
-		// Provide an empty log if we stripped it during capture
 		if (!cloned.log) cloned.log = [];
 
-		const battle = State.deserializeBattle(cloned);
-		battle.send = send as any;
+		let battle: Battle;
+		try {
+			battle = State.deserializeBattle(cloned);
+		} catch (e: any) {
+			console.log(`[Timeline Team] State.deserializeBattle failed: ${e.message}`);
+			return null;
+		}
+
+		// Validate the deserialized battle
+		if (!battle || !battle.field) {
+			console.log(`[Timeline Team] Deserialized battle missing field`);
+			return null;
+		}
+		if (!battle.sides || battle.sides.some(s => !s)) {
+			console.log(`[Timeline Team] Deserialized battle has invalid sides`);
+			return null;
+		}
+
+		// Override the readonly send property using Object.defineProperty
+		Object.defineProperty(battle, 'send', {
+			value: send,
+			writable: true,
+			configurable: true,
+		});
+
+		// Clear transient state that might interfere with new operations
+		(battle as any).activeMove = null;
+		(battle as any).activePokemon = null;
+		(battle as any).activeTarget = null;
 
 		this.battles.set(battleId, battle);
 		this.battleLogs.set(battleId, []);

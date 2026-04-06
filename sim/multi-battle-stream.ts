@@ -661,20 +661,29 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 
 	private hookBattleSend(globalId: string, battle: any) {
 		if (!battle) return;
-		battle.send = (sendType: string, data: any) => {
+		
+		const stream = this;
+		const customSend = function(this: any, sendType: string, data: any) {
 			if (Array.isArray(data)) data = data.join('\n');
-			this.pushMessage(sendType, data);
+			stream.pushMessage(sendType, data);
 
 			if (sendType === 'update') {
-				this.captureSnapshot(globalId, battle);
-				if (this.pendingTransfers.size > 0) {
-					this.turnJustResolved = true;
-					console.log(`[TIMELINE DEBUG] Turn resolved with ${this.pendingTransfers.size} pending transfers — flagged for post-update execution`);
+				stream.captureSnapshot(globalId, battle);
+				if (stream.pendingTransfers.size > 0) {
+					stream.turnJustResolved = true;
+					console.log(`[TIMELINE DEBUG] Turn resolved with ${stream.pendingTransfers.size} pending transfers`);
 				} else {
-					this.emitTimelineUpdate();
+					stream.emitTimelineUpdate();
 				}
 			}
 		};
+
+		// Use Object.defineProperty to override the readonly send property
+		Object.defineProperty(battle, 'send', {
+			value: customSend,
+			writable: true,
+			configurable: true,
+		});
 	}
 
 	/**
@@ -789,10 +798,18 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 			throw new Error(`Target battle "${targetGlobalId}" not found`);
 		}
 
-		// ── Step 1: Capture transferred Pokemon states from the live battle ──
+		const sourceBattle = this.manager.getBattle(sourceBattleId);
+		if (!sourceBattle) throw new Error(`Source battle not found`);
+		
+		const allSides: BattleSideID[] = sourceBattle.sides
+			.filter((s: any) => s)
+			.map((s: any) => s.id as BattleSideID);
+
 		const transferringSides = new Set<BattleSideID>(
 			transfers.map(t => t.sideId as BattleSideID)
 		);
+
+		// ── Step 1: Capture transferred Pokemon states ──
 		const capturedStates = new Map<BattleSideID, PokemonTransferState>();
 		for (const transfer of transfers) {
 			const side = transfer.sideId as BattleSideID;
@@ -801,58 +818,109 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 			capturedStates.set(side, state);
 		}
 
-		// ── Step 2: Snapshot source timeline before destruction ──
+		// ── Step 2: Remove transferred Pokemon from live battle ──
+		for (const side of transferringSides) {
+			this.manager.removePokemonAfterCapture(sourceBattleId, side, 0);
+		}
+
+		// ── Step 3: Snapshot source post-removal ──
 		const currentGlobalId = this.battle?.currentTimelineId || '';
 		if (currentGlobalId) {
 			const b = this.manager.getBattle(sourceBattleId);
-			if (b) this.captureSnapshot(currentGlobalId, b);
+			if (b && b.field) this.captureSnapshot(currentGlobalId, b);
 		}
 
-		// ── Step 3: Deserialize target turn state into a complete battle ──
+		// ── Step 4: Try deserialization approach, fall back to surgical if needed ──
 		const serialized = this.getStoredSerializedState(targetGlobalId, targetTurn);
-		if (!serialized) {
-			throw new Error(
-				`No serialized state for ${targetGlobalId} turn ${targetTurn} — ` +
-				`falling back is not supported`
+		let restoredBattle: Battle | null = null;
+		let usedDeserialization = false;
+
+		if (serialized) {
+			const sendFn = (type: string, data: string | string[]) => {
+				if (Array.isArray(data)) data = data.join('\n');
+				this.pushMessage(type, data);
+			};
+
+			restoredBattle = this.manager.replaceBattleFromState(
+				sourceBattleId, serialized, sendFn
 			);
+
+			if (restoredBattle) {
+				usedDeserialization = true;
+				console.log(`[TIMELINE DEBUG] Using deserialized battle for branch`);
+
+				// Remove the old active and inject transferred Pokemon
+				for (const side of transferringSides) {
+					const transferredState = capturedStates.get(side)!;
+					this.manager.removePokemonAfterCapture(sourceBattleId, side, 0);
+					const result = this.manager.receivePokemon(
+						sourceBattleId, side, transferredState, true
+					);
+					if (!result.success) {
+						console.log(`[TIMELINE DEBUG] receivePokemon failed: ${result.error}`);
+					}
+				}
+			}
 		}
 
-		const sendFn = (type: string, data: string | string[]) => {
-			this.handleBattleOutputForBranch(sourceBattleId, type, data);
-		};
+		// ── Fallback: use surgical modification if deserialization failed ──
+		if (!usedDeserialization) {
+			console.log(`[TIMELINE DEBUG] Falling back to surgical restoration`);
+			
+			const battle = this.manager.getBattle(sourceBattleId);
+			if (!battle) throw new Error(`Source battle lost during transfer`);
 
-		const restoredBattle = this.manager.replaceBattleFromState(
-			sourceBattleId, serialized, sendFn
-		);
+			// Restore field
+			const targetField = this.getStoredField(targetGlobalId, targetTurn);
+			this.manager.restoreField(sourceBattleId, targetField);
 
-		// ── Step 4: Remove the transferring side's active Pokemon ──
-		//     and inject the transferred Pokemon in its place.
-		for (const side of transferringSides) {
-			const transferredState = capturedStates.get(side)!;
+			// Restore side conditions
+			const sideCondsBySide: Partial<Record<BattleSideID, SideConditionSnapshot[] | null>> = {};
+			for (const side of allSides) {
+				const sideConds = this.getStoredSideConditions(targetGlobalId, targetTurn, side);
+				sideCondsBySide[side] = sideConds;
+				this.manager.restoreSideConditions(sourceBattleId, side, sideConds);
+			}
 
-			// Remove the old active (it belongs to the target turn, not the transfer)
-			this.manager.removePokemonAfterCapture(sourceBattleId, side, 0);
+			// Rebuild teams
+			for (const side of allSides) {
+				const snapshotSets = this.getStoredSets(targetGlobalId, targetTurn, side);
+				const snapshotDisplays = this.getStoredSnapshots(targetGlobalId, targetTurn, side);
 
-			// Receive the transferred Pokemon — switchIn triggers entry hazards,
-			// abilities, etc. against the fully-restored field/side state.
-			const result = this.manager.receivePokemon(
-				sourceBattleId, side, transferredState, true
-			);
-			if (!result.success) {
-				throw new Error(
-					`receivePokemon failed for ${side}: ${result.error}`
-				);
+				if (transferringSides.has(side)) {
+					const transferredState = capturedStates.get(side)!;
+					const result = this.manager.replaceTeamFromSnapshot(
+						sourceBattleId, side, snapshotSets || [], snapshotDisplays || [], transferredState
+					);
+					if (!result.success) throw new Error(`replaceTeamFromSnapshot failed for ${side}: ${result.error}`);
+				} else {
+					if (snapshotSets && snapshotSets.length > 0) {
+						this.manager.restoreTeamFromSnapshot(
+							sourceBattleId, side, snapshotSets, snapshotDisplays || []
+						);
+					}
+				}
+			}
+
+			// Reconnect sources and restore slot conditions
+			this.manager.reconnectConditionSources(sourceBattleId, targetField, sideCondsBySide);
+			for (const side of allSides) {
+				const slotConds = this.getStoredSlotConditions(targetGlobalId, targetTurn, side);
+				if (slotConds && Object.keys(slotConds).length > 0) {
+					this.manager.restoreSlotConditions(sourceBattleId, side, slotConds);
+				}
 			}
 		}
 
 		// ── Step 5: Register branch ──
-		const branchGlobalId = this.registerBranch(
-			sourceBattleId, targetGlobalId, targetTurn
-		);
+		const branchGlobalId = this.registerBranch(sourceBattleId, targetGlobalId, targetTurn);
 		const branchNum = this.timelineRegistry.get(branchGlobalId)!.num;
 
-		// ── Step 6: Snapshot branch initial state ──
-		this.captureSnapshot(branchGlobalId, restoredBattle);
+		// ── Step 6: Snapshot branch initial state (only if battle is valid) ──
+		const finalBattle = this.manager.getBattle(sourceBattleId);
+		if (finalBattle && finalBattle.field) {
+			this.captureSnapshot(branchGlobalId, finalBattle);
+		}
 
 		// ── Step 7: Announce ──
 		const sideList = [...transferringSides].join(' and ');

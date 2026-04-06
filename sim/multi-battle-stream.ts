@@ -476,8 +476,6 @@ function deepCloneTurnSnapshot(snap: TurnSnapshotEntry): TurnSnapshotEntry {
 	return {
 		sides,
 		field: deepCloneFieldSnapshot(snap.field),
-		// serializedBattle is already JSON-safe plain objects;
-		// JSON round-trip is a correct deep clone.
 		serializedBattle: snap.serializedBattle
 			? JSON.parse(JSON.stringify(snap.serializedBattle))
 			: null,
@@ -560,8 +558,9 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 	}
 
 	private captureSnapshot(timelineId: string, battle: any) {
-		if (!battle) return;
+		if (!battle || !battle.field) return;
 		const currentTurn = battle.turn ?? 0;
+
 		if (currentTurn < 1) return;
 		const turn = currentTurn - 1;
 
@@ -570,7 +569,6 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 		}
 		const history = this.turnSnapshots.get(timelineId)!;
 
-		// Client-facing extraction (for TimelineNodeData visualization)
 		const sides: Partial<Record<BattleSideID, SideSnapshotData>> = {};
 		let anyTeam = false;
 
@@ -584,23 +582,28 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 			const slotConditions = extractSlotConditions(battleSide);
 
 			if (team.length > 0) anyTeam = true;
+
 			sides[sideId] = { team, sets, sideConditions, slotConditions };
+
+			console.log(`[Timeline Snapshot]   ${sideId} team: ${team.length}, conditions: [${sideConditions.map(c => c.id).join(', ')}]`);
 		}
 
 		const field = extractFieldSnapshot(battle);
 
-		// Complete engine state for branch restoration
+		// Serialized state for completeness — failure here is non-fatal
+		// since the surgical snapshot data above is sufficient for branching.
 		let serializedBattle: AnyObject | null = null;
 		try {
 			serializedBattle = State.serializeBattle(battle);
-			// Strip the log to save memory — branches don't replay it
 			delete serializedBattle.log;
-			console.log(`[Timeline Snapshot] Serialized battle state for turn ${turn} (${timelineId})`);
 		} catch (e: any) {
 			console.log(`[Timeline Snapshot] State.serializeBattle failed for turn ${turn}: ${e.message}`);
 		}
 
-		if (anyTeam || serializedBattle) {
+		console.log(`[Timeline Snapshot] Capturing turn ${turn} for ${timelineId} (${Object.keys(sides).length} sides)`);
+		console.log(`[Timeline Snapshot]   field: weather=${field.weather?.id || 'none'}, terrain=${field.terrain?.id || 'none'}`);
+
+		if (anyTeam) {
 			history.set(turn, { sides, field, serializedBattle });
 		}
 	}
@@ -661,9 +664,8 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 
 	private hookBattleSend(globalId: string, battle: any) {
 		if (!battle) return;
-		
 		const stream = this;
-		const customSend = function(this: any, sendType: string, data: any) {
+		const customSend = function(sendType: string, data: any) {
 			if (Array.isArray(data)) data = data.join('\n');
 			stream.pushMessage(sendType, data);
 
@@ -678,7 +680,6 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 			}
 		};
 
-		// Use Object.defineProperty to override the readonly send property
 		Object.defineProperty(battle, 'send', {
 			value: customSend,
 			writable: true,
@@ -702,8 +703,7 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 
 		const battle = this.battle?.battle;
 		if (!battle) {
-			console.log(`[TIMELINE DEBUG] No battle found for transfer execution`);
-			return;
+			throw new Error(`No battle found for transfer execution`);
 		}
 
 		if (battle.ended) {
@@ -719,10 +719,7 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 		for (const [sideId, transfer] of transfers) {
 			const sourceBattle = this.manager.getBattle(transfer.sourceBattleId);
 			if (!sourceBattle) {
-				console.log(`[TIMELINE DEBUG] Source battle not found — skipping ${sideId}`);
-				this.pushMessage('update',
-					`|-message|Transfer cancelled for ${sideId}: source battle unavailable.`);
-				continue;
+				throw new Error(`Source battle not found for ${sideId} transfer`);
 			}
 
 			const side = sourceBattle[transfer.sideId as BattleSideID];
@@ -755,33 +752,42 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 
 		console.log(`[TIMELINE DEBUG] ${groups.size} distinct transfer target(s)`);
 
-		let anyTransferExecuted = false;
-
+		// Errors propagate — the battle crashes on failure
 		for (const [groupKey, groupTransfers] of groups) {
 			console.log(`[TIMELINE DEBUG] Group "${groupKey}": ${groupTransfers.map(t => t.sideId).join(', ')}`);
-			try {
-				this.executeTransferGroup(groupTransfers);
-				anyTransferExecuted = true;
-			} catch (err: any) {
-				console.log(`[TIMELINE DEBUG] Group execution failed: ${err.message}`);
-				for (const t of groupTransfers) {
-					this.pushMessage('update',
-						`|-message|Transfer failed for ${t.sideId}: ${err.message}`);
-				}
-			}
-		}
-
-		if (!anyTransferExecuted) {
-			console.log(`[TIMELINE DEBUG] No transfers executed — leaving battle state intact`);
-			this.emitTimelineUpdate();
-			return;
+			this.executeTransferGroup(groupTransfers);
 		}
 
 		this.switchToPresentIfNeeded();
-
 		this.finalizeAfterTransfers(battle);
 	}
 
+	/**
+	 * Executes one group of transfers that all share the same target
+	 * (targetGlobalId + targetTurn).
+	 *
+	 * Restoration ordering:
+	 *
+	 *   1.  Capture transferred-Pokemon states (read live active slots)
+	 *   2.  Remove transferred Pokemon from the live battle
+	 *   3.  Snapshot the source timeline post-removal
+	 *   4.  Restore FIELD from target turn (battle-scoped, once)
+	 *   5.  Restore BOTH SIDES' side conditions from target turn
+	 *       — must finish before any switchIn so entry hazards are correct
+	 *   6.  Rebuild each side's team:
+	 *       — transferring side: roster rebuilt, switchIn DEFERRED
+	 *       — non-transferring side: roster rebuilt, active placed directly
+	 *   7.  Reset battle engine state (queue, midTurn, request, etc.)
+	 *       — ensures switchIn and makeRequest operate on clean state
+	 *   8.  switchIn for each transferred Pokemon
+	 *       — runs in clean battle context so hazards/abilities fire correctly
+	 *   9.  Reconnect source refs on field + side conditions
+	 *  10.  Restore slot conditions
+	 *  11.  Register branch, snapshot its initial state
+	 *
+	 * Errors propagate — the battle crashes rather than limping forward
+	 * with inconsistent state.
+	 */
 	private executeTransferGroup(transfers: PendingTransfer[]) {
 		if (transfers.length === 0) return;
 
@@ -800,7 +806,6 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 
 		const sourceBattle = this.manager.getBattle(sourceBattleId);
 		if (!sourceBattle) throw new Error(`Source battle not found`);
-		
 		const allSides: BattleSideID[] = sourceBattle.sides
 			.filter((s: any) => s)
 			.map((s: any) => s.id as BattleSideID);
@@ -809,7 +814,7 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 			transfers.map(t => t.sideId as BattleSideID)
 		);
 
-		// ── Step 1: Capture transferred Pokemon states ──
+		// ── Step 1: Capture ──
 		const capturedStates = new Map<BattleSideID, PokemonTransferState>();
 		for (const transfer of transfers) {
 			const side = transfer.sideId as BattleSideID;
@@ -818,7 +823,7 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 			capturedStates.set(side, state);
 		}
 
-		// ── Step 2: Remove transferred Pokemon from live battle ──
+		// ── Step 2: Remove ──
 		for (const side of transferringSides) {
 			this.manager.removePokemonAfterCapture(sourceBattleId, side, 0);
 		}
@@ -827,107 +832,96 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 		const currentGlobalId = this.battle?.currentTimelineId || '';
 		if (currentGlobalId) {
 			const b = this.manager.getBattle(sourceBattleId);
-			if (b && b.field) this.captureSnapshot(currentGlobalId, b);
+			if (b) this.captureSnapshot(currentGlobalId, b);
 		}
 
-		// ── Step 4: Try deserialization approach, fall back to surgical if needed ──
-		const serialized = this.getStoredSerializedState(targetGlobalId, targetTurn);
-		let restoredBattle: Battle | null = null;
-		let usedDeserialization = false;
+		// ── Step 4: Field ──
+		const targetField = this.getStoredField(targetGlobalId, targetTurn);
+		this.manager.restoreField(sourceBattleId, targetField);
 
-		if (serialized) {
-			const sendFn = (type: string, data: string | string[]) => {
-				if (Array.isArray(data)) data = data.join('\n');
-				this.pushMessage(type, data);
-			};
+		// ── Step 5: Side conditions ──
+		const sideCondsBySide: Partial<Record<BattleSideID, SideConditionSnapshot[] | null>> = {};
+		for (const side of allSides) {
+			const sideConds = this.getStoredSideConditions(targetGlobalId, targetTurn, side);
+			sideCondsBySide[side] = sideConds;
+			this.manager.restoreSideConditions(sourceBattleId, side, sideConds);
+		}
 
-			restoredBattle = this.manager.replaceBattleFromState(
-				sourceBattleId, serialized, sendFn
-			);
+		// ── Step 6: Teams — transferring sides defer switchIn ──
+		const deferredSwitchIns = new Map<BattleSideID, any>(); // Pokemon objects
 
-			if (restoredBattle) {
-				usedDeserialization = true;
-				console.log(`[TIMELINE DEBUG] Using deserialized battle for branch`);
+		for (const side of allSides) {
+			const snapshotSets = this.getStoredSets(targetGlobalId, targetTurn, side);
+			const snapshotDisplays = this.getStoredSnapshots(targetGlobalId, targetTurn, side);
 
-				// Remove the old active and inject transferred Pokemon
-				for (const side of transferringSides) {
-					const transferredState = capturedStates.get(side)!;
-					this.manager.removePokemonAfterCapture(sourceBattleId, side, 0);
-					const result = this.manager.receivePokemon(
-						sourceBattleId, side, transferredState, true
+			if (transferringSides.has(side)) {
+				const transferredState = capturedStates.get(side)!;
+				const result = this.manager.replaceTeamFromSnapshot(
+					sourceBattleId, side,
+					snapshotSets || [], snapshotDisplays || [],
+					transferredState,
+					false // defer switchIn
+				);
+				if (!result.success) {
+					throw new Error(`replaceTeamFromSnapshot failed for ${side}: ${result.error}`);
+				}
+				if (!result.pokemon) {
+					throw new Error(`replaceTeamFromSnapshot did not return pokemon for ${side}`);
+				}
+				deferredSwitchIns.set(side, result.pokemon);
+			} else {
+				if (snapshotSets && snapshotSets.length > 0) {
+					this.manager.restoreTeamFromSnapshot(
+						sourceBattleId, side, snapshotSets, snapshotDisplays || []
 					);
-					if (!result.success) {
-						console.log(`[TIMELINE DEBUG] receivePokemon failed: ${result.error}`);
-					}
 				}
 			}
 		}
 
-		// ── Fallback: use surgical modification if deserialization failed ──
-		if (!usedDeserialization) {
-			console.log(`[TIMELINE DEBUG] Falling back to surgical restoration`);
-			
-			const battle = this.manager.getBattle(sourceBattleId);
-			if (!battle) throw new Error(`Source battle lost during transfer`);
+		// ── Step 7: Reset battle engine state ──
+		// The battle just finished resolving a turn and still has stale
+		// midTurn/queue/request state. switchIn and makeRequest both expect
+		// clean state — running switchIn on a battle whose queue still has
+		// residual actions from the previous turn corrupts side references.
+		this.resetBattleForBranch(sourceBattle);
 
-			// Restore field
-			const targetField = this.getStoredField(targetGlobalId, targetTurn);
-			this.manager.restoreField(sourceBattleId, targetField);
-
-			// Restore side conditions
-			const sideCondsBySide: Partial<Record<BattleSideID, SideConditionSnapshot[] | null>> = {};
-			for (const side of allSides) {
-				const sideConds = this.getStoredSideConditions(targetGlobalId, targetTurn, side);
-				sideCondsBySide[side] = sideConds;
-				this.manager.restoreSideConditions(sourceBattleId, side, sideConds);
-			}
-
-			// Rebuild teams
-			for (const side of allSides) {
-				const snapshotSets = this.getStoredSets(targetGlobalId, targetTurn, side);
-				const snapshotDisplays = this.getStoredSnapshots(targetGlobalId, targetTurn, side);
-
-				if (transferringSides.has(side)) {
-					const transferredState = capturedStates.get(side)!;
-					const result = this.manager.replaceTeamFromSnapshot(
-						sourceBattleId, side, snapshotSets || [], snapshotDisplays || [], transferredState
-					);
-					if (!result.success) throw new Error(`replaceTeamFromSnapshot failed for ${side}: ${result.error}`);
-				} else {
-					if (snapshotSets && snapshotSets.length > 0) {
-						this.manager.restoreTeamFromSnapshot(
-							sourceBattleId, side, snapshotSets, snapshotDisplays || []
-						);
-					}
-				}
-			}
-
-			// Reconnect sources and restore slot conditions
-			this.manager.reconnectConditionSources(sourceBattleId, targetField, sideCondsBySide);
-			for (const side of allSides) {
-				const slotConds = this.getStoredSlotConditions(targetGlobalId, targetTurn, side);
-				if (slotConds && Object.keys(slotConds).length > 0) {
-					this.manager.restoreSlotConditions(sourceBattleId, side, slotConds);
-				}
+		// ── Step 8: switchIn for transferred Pokemon ──
+		// Runs on a clean battle: no stale queue entries, no stale request.
+		// Entry hazards, Intimidate, weather abilities all fire correctly
+		// because side conditions and field were restored in steps 4-5.
+		for (const [side, pokemon] of deferredSwitchIns) {
+			console.log(`[TIMELINE DEBUG] Deferred switchIn: ${pokemon.name} into ${side}`);
+			sourceBattle.actions.switchIn(pokemon, 0);
+			if (!sourceBattle[side].active[0] || sourceBattle[side].active[0].fainted) {
+				throw new Error(
+					`switchIn failed for ${pokemon.name} on ${side} — active slot is empty or fainted`
+				);
 			}
 		}
 
-		// ── Step 5: Register branch ──
+		// ── Step 9: Reconnect sources ──
+		this.manager.reconnectConditionSources(sourceBattleId, targetField, sideCondsBySide);
+
+		// ── Step 10: Slot conditions ──
+		for (const side of allSides) {
+			const slotConds = this.getStoredSlotConditions(targetGlobalId, targetTurn, side);
+			if (slotConds && Object.keys(slotConds).length > 0) {
+				this.manager.restoreSlotConditions(sourceBattleId, side, slotConds);
+			}
+		}
+
+		// ── Step 11: Register the branch timeline ──
 		const branchGlobalId = this.registerBranch(sourceBattleId, targetGlobalId, targetTurn);
 		const branchNum = this.timelineRegistry.get(branchGlobalId)!.num;
 
-		// ── Step 6: Snapshot branch initial state (only if battle is valid) ──
-		const finalBattle = this.manager.getBattle(sourceBattleId);
-		if (finalBattle && finalBattle.field) {
-			this.captureSnapshot(branchGlobalId, finalBattle);
-		}
+		// Snapshot the branch's initial state
+		this.captureSnapshot(branchGlobalId, sourceBattle);
 
-		// ── Step 7: Announce ──
+		// Announce
 		const sideList = [...transferringSides].join(' and ');
 		const coord = `Timeline ${targetGlobalId}, Turn ${targetTurn}`;
 		this.pushMessage('update',
-			`|-message|${sideList}'s Pokémon transferred to ${coord}! ` +
-			`Branch #${branchNum} created at turn ${targetTurn + 1}.`
+			`|-message|${sideList}'s Pokémon transferred to ${coord}! Branch #${branchNum} created at turn ${targetTurn + 1}.`
 		);
 	}
 
@@ -939,6 +933,64 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 	) {
 		if (Array.isArray(data)) data = data.join('\n');
 		this.pushMessage(type, data);
+	}
+
+	/**
+	 * Resets transient battle-engine state so that switchIn and makeRequest
+	 * operate on a clean slate.
+	 *
+	 * After surgical team/field restoration the battle still carries stale
+	 * state from the turn that just resolved: midTurn is true, the action
+	 * queue has residual entries, requestState points at the old request,
+	 * and activeMove/activePokemon may reference Pokemon that no longer
+	 * exist in the rebuilt roster. Running switchIn or makeRequest against
+	 * this stale state causes null-reference crashes in side.clearChoice
+	 * and toRef.
+	 *
+	 * This method zeroes out exactly the fields that need to be clean for
+	 * switchIn → makeRequest to succeed. It does NOT touch field state,
+	 * side conditions, or team rosters — those are the caller's
+	 * responsibility.
+	 */
+	private resetBattleForBranch(battle: any): void {
+		console.log(`[TIMELINE DEBUG] resetBattleForBranch: clearing engine state`);
+
+		// ── Turn resolution state ──
+		battle.midTurn = false;
+		battle.activeMove = null;
+		battle.activePokemon = null;
+		battle.activeTarget = null;
+
+		// ── Request state ──
+		// makeRequest sets this itself, but a stale value can cause it
+		// to take the wrong code path before it gets there.
+		battle.requestState = '';
+
+		// ── Action queue ──
+		// Residual queue entries (end-of-turn weather, status damage, etc.)
+		// reference Pokemon from the old roster. They must not execute.
+		if (battle.queue?.list) {
+			battle.queue.list = [];
+		}
+
+		// ── Move tracking ──
+		// These reference the old roster's move objects / Pokemon.
+		battle.lastMove = null;
+		battle.lastSuccessfulMoveThisTurn = null;
+		battle.lastMoveLine = 0;
+
+		// ── Per-side state ──
+		for (const side of battle.sides) {
+			if (!side) continue;
+
+			// Clear stale request — makeRequest will generate a fresh one
+			side.activeRequest = null;
+
+			// Clear choice state so makeRequest starts clean
+			side.clearChoice();
+		}
+
+		console.log(`[TIMELINE DEBUG] resetBattleForBranch: done`);
 	}
 
 	/**
@@ -1002,9 +1054,11 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 	}
 
 	/**
-	 * Post-transfer cleanup shared by all transfer paths.
-	 * Ensures slotConditions are valid, issues a move request,
-	 * flushes battle updates, and emits the timeline visualization.
+	 * Post-transfer cleanup: issues a move request, flushes battle
+	 * updates, and emits the timeline visualization.
+	 *
+	 * Errors propagate to the caller — if makeRequest or sendUpdates
+	 * fails, the battle crashes rather than continuing with invalid state.
 	 */
 	private finalizeAfterTransfers(battle: any) {
 		// Ensure slotConditions are valid for all sides
@@ -1016,93 +1070,24 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 			}
 		}
 
-		// Issue move request; fall back to manual construction if needed
-		try {
-			console.log(`[TIMELINE DEBUG] Issuing move request after transfers`);
-			battle.makeRequest('move');
-		} catch (e: any) {
-			console.log(`[TIMELINE DEBUG] makeRequest threw: ${e.message} — attempting fallback`);
-			try {
-				battle.requestState = 'move';
-				for (const side of battle.sides) {
-					if (!side) continue;
-					side.clearChoice();
-
-					const pokemon = side.pokemon.map((mon: any, i: number) => {
-						const isActive = i < side.active.length && side.active[i] === mon;
-						return {
-							ident: `${side.id}: ${mon.name}`,
-							details: mon.details || `${mon.species.name}, L${mon.level}`,
-							condition: mon.fainted
-								? '0 fnt'
-								: `${mon.hp}/${mon.maxhp}${mon.status ? ` ${mon.status}` : ''}`,
-							active: isActive,
-							stats: {
-								atk: mon.baseStoredStats?.atk || 0,
-								def: mon.baseStoredStats?.def || 0,
-								spa: mon.baseStoredStats?.spa || 0,
-								spd: mon.baseStoredStats?.spd || 0,
-								spe: mon.baseStoredStats?.spe || 0,
-							},
-							moves: (mon.moves || mon.moveSlots?.map((m: any) => m.id) || []) as ID[],
-							baseAbility: mon.baseAbility || mon.ability || '',
-							item: mon.item || '',
-							pokeball: mon.pokeball || 'pokeball',
-							ability: mon.ability || '',
-							teraType: mon.teraType || '',
-							terastallized: mon.terastallized || '',
-						};
-					});
-
-					const activeMon = side.active[0];
-					let activeData: any[] = [];
-					if (activeMon && !activeMon.fainted) {
-						activeData = [{
-							moves: activeMon.moveSlots.map((s: any) => ({
-								move: s.move,
-								id: s.id,
-								pp: s.pp,
-								maxpp: s.maxpp,
-								target: s.target || 'normal',
-								disabled: s.disabled || false,
-							})),
-							canDynamax: false,
-							canTerastallize: activeMon.teraType && !activeMon.terastallized
-								? activeMon.teraType : undefined,
-						}];
-					}
-
-					const request: any = {
-						requestType: 'move',
-						active: activeData,
-						side: { name: side.name, id: side.id, pokemon },
-					};
-
-					if (!activeMon || activeMon.fainted) {
-						const hasAlive = side.pokemon.some((p: any) => !p.fainted && p.hp > 0);
-						request.requestType = hasAlive ? 'switch' : 'wait';
-						if (hasAlive) {
-							request.forceSwitch = [true];
-							delete request.active;
-						} else {
-							request.wait = true;
-						}
-					}
-
-					side.activeRequest = request;
-				}
-				battle.sentRequests = false;
-				console.log(`[TIMELINE DEBUG] Manual request fallback completed`);
-			} catch (fallbackErr: any) {
-				console.log(`[TIMELINE DEBUG] Manual fallback also failed: ${fallbackErr.message}`);
+		// Validate battle state before issuing request
+		for (const side of battle.sides) {
+			if (!side) {
+				throw new Error(`finalizeAfterTransfers: null side in battle.sides`);
+			}
+			if (!side.active[0] && side.pokemonLeft > 0) {
+				throw new Error(
+					`finalizeAfterTransfers: ${side.id} has ${side.pokemonLeft} Pokemon left but empty active slot`
+				);
 			}
 		}
 
-		try {
-			battle.sendUpdates();
-		} catch (e: any) {
-			console.log(`[TIMELINE DEBUG] sendUpdates threw: ${e.message}`);
-		}
+		// Reset engine state to ensure makeRequest operates cleanly
+		this.resetBattleForBranch(battle);
+
+		console.log(`[TIMELINE DEBUG] Issuing move request after transfers`);
+		battle.makeRequest('move');
+		battle.sendUpdates();
 
 		const entry = this.timelineRegistry.get(this.battle!.currentTimelineId);
 		if (entry) this.captureSnapshot(this.battle!.currentTimelineId, battle);
@@ -1163,38 +1148,56 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 		if (this.battle.currentTimelineId === presentId) return false;
 
 		const entry = this.timelineRegistry.get(presentId)!;
-		const presentTurn = this.getTimelineHeadTurn(presentId);
+		const battle = this.manager.getBattle(entry.battleId);
+		if (!battle) return false;
 
-		console.log(
-			`[TIMELINE DEBUG] Present shift: ` +
-			`${this.battle.currentTimelineId} → ${presentId} @ turn ${presentTurn}`
-		);
+		const presentTurn = this.getTimelineHeadTurn(presentId);
+		console.log(`[TIMELINE DEBUG] Present shift: ${this.battle.currentTimelineId} → ${presentId} @ turn ${presentTurn}`);
 
 		// Snapshot outgoing timeline
 		const outgoingId = this.battle.currentTimelineId;
 		const outEntry = this.timelineRegistry.get(outgoingId);
-		const outBattle = outEntry
-			? this.manager.getBattle(outEntry.battleId)
-			: null;
+		const outBattle = outEntry ? this.manager.getBattle(outEntry.battleId) : null;
 		if (outBattle) this.captureSnapshot(outgoingId, outBattle);
 
-		// Deserialize the present timeline's state
-		const serialized = this.getStoredSerializedState(presentId, presentTurn);
-		if (!serialized) {
-			console.log(
-				`[TIMELINE DEBUG] No serialized state for present ` +
-				`${presentId} turn ${presentTurn} — skipping shift`
-			);
-			return false;
+		const allSides: BattleSideID[] = battle.sides
+			.filter((s: any) => s)
+			.map((s: any) => s.id as BattleSideID);
+
+		// ── Field ──
+		const presentField = this.getStoredField(presentId, presentTurn);
+		this.manager.restoreField(entry.battleId, presentField);
+
+		// ── Side conditions ──
+		const sideCondsBySide: Partial<Record<BattleSideID, SideConditionSnapshot[] | null>> = {};
+		for (const side of allSides) {
+			const conds = this.getStoredSideConditions(presentId, presentTurn, side);
+			sideCondsBySide[side] = conds;
+			this.manager.restoreSideConditions(entry.battleId, side, conds);
 		}
 
-		const sendFn = (type: string, data: string | string[]) => {
-			this.handleBattleOutputForBranch(entry.battleId, type, data);
-		};
+		// ── Teams (direct placement, no switchIn) ──
+		for (const side of allSides) {
+			const sets = this.getStoredSets(presentId, presentTurn, side);
+			const displays = this.getStoredSnapshots(presentId, presentTurn, side);
+			if (sets?.length && displays?.length) {
+				this.manager.restoreTeamFromSnapshot(entry.battleId, side, sets, displays);
+			}
+		}
 
-		const battle = this.manager.replaceBattleFromState(
-			entry.battleId, serialized, sendFn
-		);
+		// ── Reconnect ──
+		this.manager.reconnectConditionSources(entry.battleId, presentField, sideCondsBySide);
+
+		// ── Slot conditions ──
+		for (const side of allSides) {
+			const slotConds = this.getStoredSlotConditions(presentId, presentTurn, side);
+			if (slotConds && Object.keys(slotConds).length > 0) {
+				this.manager.restoreSlotConditions(entry.battleId, side, slotConds);
+			}
+		}
+
+		// ── Reset engine state ──
+		this.resetBattleForBranch(battle);
 
 		battle.turn = presentTurn;
 		this.battle.currentTimelineId = presentId;

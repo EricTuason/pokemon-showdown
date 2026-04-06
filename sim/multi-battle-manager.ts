@@ -1702,27 +1702,30 @@ export class MultiBattleManager {
 		return pokemon;
 	}
 
-	/**
+		/**
 	 * Replaces a side's team with a stored team snapshot from a timeline node,
-	 * then adds the transferred Pokemon as the new active Pokemon.
+	 * then adds the transferred Pokemon to the roster.
 	 *
-	 * The transferred Pokemon is a genuine new arrival to this battle state,
-	 * so battle.actions.switchIn is used and entry hazards / on-entry abilities
-	 * trigger normally. Callers must restore side conditions BEFORE calling
-	 * this so those hazards reflect the target turn.
+	 * When performSwitchIn is false the transferred Pokemon is added to the
+	 * roster but NOT placed in the active slot. The caller is responsible for
+	 * calling battle.actions.switchIn after resetting battle state. This
+	 * separation prevents switchIn from running on a half-rebuilt battle
+	 * whose request/queue state is stale from the previous turn.
+	 *
+	 * Callers must restore side conditions BEFORE calling this so those
+	 * hazards reflect the target turn.
 	 *
 	 * NOTE: This method does NOT call makeRequest() or sendUpdates().
-	 * The caller (MultiTimeBattleStream) is responsible for triggering
-	 * new requests and flushing updates after all transfers are complete.
 	 */
 	replaceTeamFromSnapshot(
 		battleId: string,
 		side: BattleSideID,
 		snapshotSets: PokemonSet[],
 		snapshotDisplays: PokemonSnapshot[],
-		transferredState: PokemonTransferState
-	): TransferResult {
-		console.log(`[Timeline Team] replaceTeamFromSnapshot("${battleId}", "${side}")`);
+		transferredState: PokemonTransferState,
+		performSwitchIn: boolean = true
+	): TransferResult & { pokemon?: Pokemon } {
+		console.log(`[Timeline Team] replaceTeamFromSnapshot("${battleId}", "${side}", switchIn=${performSwitchIn})`);
 		console.log(`[Timeline Team]   Snapshot sets: ${snapshotSets.length}, displays: ${snapshotDisplays.length}`);
 		console.log(`[Timeline Team]   Transferred: ${transferredState.set.name || transferredState.set.species}`);
 
@@ -1759,8 +1762,6 @@ export class MultiBattleManager {
 		battleSide.pokemonLeft = 0;
 
 		// ── STEP 3: Reset slotConditions for all active slots ──
-		// Slot conditions are restored separately AFTER this method returns
-		// (they don't affect switchIn, and this rebuild would wipe them).
 		battleSide.slotConditions = [];
 		for (let i = 0; i < battleSide.active.length; i++) {
 			battleSide.slotConditions[i] = {};
@@ -1768,8 +1769,6 @@ export class MultiBattleManager {
 		console.log(`[Timeline Team] Team cleared, slotConditions reset (${battleSide.active.length} slots)`);
 
 		// ── STEP 4: Add the transferred Pokemon FIRST (position 0) ──
-		// This ensures it's at position 0 which the battle engine considers
-		// the active slot for singles.
 		const completeTransferSet = ensureCompletePokemonSet(transferredState.set);
 		const transferredPokemon = battleSide.addPokemon(completeTransferSet);
 		if (!transferredPokemon) {
@@ -1787,7 +1786,6 @@ export class MultiBattleManager {
 				continue;
 			}
 
-			// Find matching display data for HP/status
 			const display = displayByName.get(pokemon.name.toLowerCase())
 				|| displayByName.get(pokemon.species.name.toLowerCase());
 
@@ -1810,28 +1808,25 @@ export class MultiBattleManager {
 			}
 		}
 
-		// ── STEP 6: Switch in the transferred Pokemon (position 0) ──
-		// Full switchIn path: entry hazards, Intimidate, weather abilities
-		// all fire. Side conditions must have been restored by the caller
-		// beforehand for hazards to be correct.
-		try {
-			battle.actions.switchIn(transferredPokemon, 0);
-			console.log(`[Timeline Team] Switched in ${transferredPokemon.name} via battle.actions.switchIn`);
-		} catch (e: any) {
-			console.log(`[Timeline Team] switchIn threw: ${e.message}, using manual fallback`);
-			battleSide.active[0] = transferredPokemon;
-			transferredPokemon.isActive = true;
-			transferredPokemon.activeTurns = 0;
-			transferredPokemon.activeMoveActions = 0;
-			transferredPokemon.position = 0;
+		// ── STEP 6: Switch in or defer to caller ──
+		if (performSwitchIn) {
+			try {
+				battle.actions.switchIn(transferredPokemon, 0);
+				console.log(`[Timeline Team] Switched in ${transferredPokemon.name} via battle.actions.switchIn`);
+			} catch (e: any) {
+				throw new Error(
+					`switchIn failed for ${transferredPokemon.name} in replaceTeamFromSnapshot: ${e.message}`
+				);
+			}
+		} else {
+			console.log(`[Timeline Team] switchIn deferred to caller for ${transferredPokemon.name}`);
 		}
 
-		// ── STEP 7: Verify positions are correct ──
-		if (!battleSide.active[0] || battleSide.active[0].fainted) {
-			console.log(`[Timeline Team] Active slot still empty after switchIn, forcing manually`);
-			battleSide.active[0] = transferredPokemon;
-			transferredPokemon.isActive = true;
-			transferredPokemon.position = 0;
+		// ── STEP 7: Verify active slot ──
+		if (performSwitchIn && (!battleSide.active[0] || battleSide.active[0].fainted)) {
+			throw new Error(
+				`Active slot empty after switchIn for ${transferredPokemon.name} — battle state is invalid`
+			);
 		}
 
 		// Ensure slotConditions has entries for all active positions
@@ -1864,7 +1859,7 @@ export class MultiBattleManager {
 		console.log(`[Timeline Team]   active[0]: ${battleSide.active[0]?.name || 'EMPTY'}`);
 		console.log(`[Timeline Team]   pokemonLeft: ${battleSide.pokemonLeft}`);
 
-		return { success: true, transferredPokemon: transferredState };
+		return { success: true, transferredPokemon: transferredState, pokemon: transferredPokemon };
 	}
 
 	/**

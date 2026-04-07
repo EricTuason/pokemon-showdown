@@ -557,12 +557,20 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 		this.battle = null;
 	}
 
-	private captureSnapshot(timelineId: string, battle: any) {
+		/**
+	 * Captures the battle state for a specific turn.
+	 * 
+	 * @param timelineId - The timeline to store the snapshot in
+	 * @param battle - The battle to capture
+	 * @param completedTurn - The turn number that just completed. If omitted,
+	 *                        defaults to battle.turn - 1 (for backward compatibility
+	 *                        with direct calls after transfers/present-shifts).
+	 */
+	private captureSnapshot(timelineId: string, battle: any, completedTurn?: number) {
 		if (!battle || !battle.field) return;
-		const currentTurn = battle.turn ?? 0;
 
-		if (currentTurn < 1) return;
-		const turn = currentTurn - 1;
+		const turn = completedTurn ?? (battle.turn - 1);
+		if (turn < 0) return;
 
 		if (!this.turnSnapshots.has(timelineId)) {
 			this.turnSnapshots.set(timelineId, new Map());
@@ -591,7 +599,6 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 		const field = extractFieldSnapshot(battle);
 
 		// Serialized state for completeness — failure here is non-fatal
-		// since the surgical snapshot data above is sufficient for branching.
 		let serializedBattle: AnyObject | null = null;
 		try {
 			serializedBattle = State.serializeBattle(battle);
@@ -670,7 +677,18 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 			stream.pushMessage(sendType, data);
 
 			if (sendType === 'update') {
-				stream.captureSnapshot(globalId, battle);
+				// Only capture a snapshot when we see a |turn| message, which
+				// indicates the previous turn has fully completed. This avoids
+				// capturing mid-turn state from intermediate updates.
+				const turnMatch = data.match(/\|turn\|(\d+)/);
+				if (turnMatch) {
+					const newTurn = parseInt(turnMatch[1], 10);
+					// The |turn|N message means turn N is starting, so turn N-1
+					// just completed. Capture the completed turn's state.
+					const completedTurn = newTurn - 1;
+					stream.captureSnapshot(globalId, battle, completedTurn);
+				}
+
 				if (stream.pendingTransfers.size > 0) {
 					stream.turnJustResolved = true;
 					console.log(`[TIMELINE DEBUG] Turn resolved with ${stream.pendingTransfers.size} pending transfers`);
@@ -910,12 +928,13 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 			}
 		}
 
-		// ── Step 11: Register the branch timeline ──
+				// ── Step 11: Register the branch timeline ──
 		const branchGlobalId = this.registerBranch(sourceBattleId, targetGlobalId, targetTurn);
 		const branchNum = this.timelineRegistry.get(branchGlobalId)!.num;
 
-		// Snapshot the branch's initial state
-		this.captureSnapshot(branchGlobalId, sourceBattle);
+		// Snapshot the branch's initial state — this is the state at the END of
+		// targetTurn (which is what we restored to), so label it as targetTurn.
+		this.captureSnapshot(branchGlobalId, sourceBattle, targetTurn);
 
 		// Announce
 		const sideList = [...transferringSides].join(' and ');
@@ -1154,11 +1173,18 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 		const presentTurn = this.getTimelineHeadTurn(presentId);
 		console.log(`[TIMELINE DEBUG] Present shift: ${this.battle.currentTimelineId} → ${presentId} @ turn ${presentTurn}`);
 
-		// Snapshot outgoing timeline
+		// Snapshot outgoing timeline with its current completed turn
 		const outgoingId = this.battle.currentTimelineId;
 		const outEntry = this.timelineRegistry.get(outgoingId);
 		const outBattle = outEntry ? this.manager.getBattle(outEntry.battleId) : null;
-		if (outBattle) this.captureSnapshot(outgoingId, outBattle);
+		if (outBattle) {
+			// The outgoing battle's current turn is the one in progress;
+			// the completed turn is one less.
+			const outCompletedTurn = outBattle.turn - 1;
+			if (outCompletedTurn >= 0) {
+				this.captureSnapshot(outgoingId, outBattle, outCompletedTurn);
+			}
+		}
 
 		const allSides: BattleSideID[] = battle.sides
 			.filter((s: any) => s)

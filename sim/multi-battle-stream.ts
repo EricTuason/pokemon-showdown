@@ -61,17 +61,61 @@ type SideSnapshotData = {
 	slotConditions: { [slot: number]: SlotConditionSnapshot[] };
 };
 
+/**
+ * Converts a string to a lowercase alphanumeric ID.
+ * Strips accents/diacritics and non-alphanumeric characters.
+ */
+function toID(s: string): string {
+  return ('' + s)
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
+}
+
+/**
+ * Generates candidate sprite IDs for a Pokemon in priority order.
+ * Handles battle Pokemon objects, species objects, and Pokedex entries.
+ */
+function candidateSpriteIds(pokemon: any): string[] {
+  // Handle different input structures:
+  // - Battle Pokemon: pokemon.species.baseSpecies, pokemon.species.forme
+  // - Species object: species.baseSpecies, species.forme
+  // - Pokedex entry: entry.name, entry.baseSpecies, entry.forme
+  const species = pokemon.species || pokemon.speciesData || pokemon;
+  
+  const name = species.name || pokemon.name || 'substitute';
+  const baseSpecies = species.baseSpecies || name;
+  const forme = species.forme || '';
+  
+  const base = toID(baseSpecies);
+  const out: string[] = [];
+  const push = (id: string) => { if (id && !out.includes(id)) out.push(id); };
+
+  if (forme) {
+    // Full forme ID (e.g., "Mega-X" -> "charizard-megax")
+    push(`${base}-${toID(forme)}`);
+    
+    // Try progressively shorter forme suffixes
+    // e.g., "Mega-X" splits to ["Mega", "X"] -> try "charizard-mega"
+    const parts = forme.split(/[- ]/);
+    for (let i = parts.length - 1; i > 0; i--) {
+      push(`${base}-${toID(parts.slice(0, i).join(''))}`);
+    }
+  }
+  
+  // Always include base as fallback
+  push(base);
+  
+  return out;
+}
+
+/**
+ * Returns the best-guess sprite ID for a Pokemon.
+ */
 function pokemonToSpriteId(pokemon: any): string {
-	const name: string =
-		pokemon.species?.name ||
-		pokemon.speciesData?.name ||
-		pokemon.name ||
-		'substitute';
-	return name
-		.split(',')[0]
-		.trim()
-		.toLowerCase()
-		.replace(/[^a-z0-9-]/g, '');
+  const candidates = candidateSpriteIds(pokemon);
+  return candidates[0] || 'substitute';
 }
 
 /**

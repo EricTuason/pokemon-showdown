@@ -862,32 +862,27 @@ export class RoomBattle extends RoomGame<RoomBattlePlayer> {
 					this.turn = parseInt(line.slice(6));
 				}
 
-				// ── NEW: intercept timeline node data ──
 				if (line.startsWith('|timenodes|')) {
 					try {
 						const json = JSON.parse(line.slice('|timenodes|'.length));
-
-						// Stash for the /view-timeline-<roomid> page handler. Only the
-						// most recent snapshot is kept — the page is read-only, not live.
 						this.lastTimelineData = json;
 
 						const html = generateTimelineHTML(json);
 						const popoutBar = this.buildTimelinePopoutBar();
-
-						// uhtml to create, uhtmlchange to update without scroll jump
 						const cmd = this.timelineVizCreated ? 'uhtmlchange' : 'uhtml';
 						this.room.add(`|${cmd}|timeline-viz|${html}${popoutBar}`);
 						this.timelineVizCreated = true;
 
-						// Add transfer UI below timeline (separate from visualization)
 						const transferUI = this.generateTransferUI(json.nodes);
 						this.room.add(`|uhtml|timeline-transfer|${transferUI}`);
+
+						// NEW — push the fresh snapshot to any open /view-timeline-* tabs
+						this.refreshTimelineViewers();
 					} catch (e: any) {
 						Monitor.crashlog(e, 'Timeline UI render');
 					}
-					continue; // don't echo raw timenodes into chat log
+					continue;
 				}
-				// ── END NEW ──
 
 				this.room.add(line);
 				if (line.startsWith(`|bigerror|You will auto-tie if `) && Config.allowrequestingties && !this.room.tour) {
@@ -1474,6 +1469,29 @@ export class RoomBattle extends RoomGame<RoomBattlePlayer> {
 	}
 
 	/**
+	 * Re-render `/view-timeline-<roomid>` for every connection that currently
+	 * has it open. Pages don't subscribe to rooms, so we look them up via
+	 * `connection.openPages` and re-run the page handler by re-parsing the
+	 * join command — same effect as the user clicking Refresh.
+	 *
+	 * Only scans users who are in the battle room. A viewer in a completely
+	 * separate browser window (ctrl-click → fresh PS client) that hasn't
+	 * joined the battle won't be found here; they still have the manual
+	 * Refresh button as a fallback.
+	 */
+	private refreshTimelineViewers() {
+		const pageKey = `timeline-${this.roomid}`;          // openPages stores it without the "view-" prefix
+		for (const userid in this.room.users) {
+			const user = this.room.users[userid];
+			for (const conn of user.connections) {
+				if (conn.openPages?.has(pageKey)) {
+					void Chat.parse(`/join view-${pageKey}`, this.room, user, conn);
+				}
+			}
+		}
+	}
+
+	/**
 	 * Builds the "pop out timeline" bar shown under the in-chat timeline viz.
 	 *
 	 * Two affordances, both static HTML because Showdown's chat sanitizer
@@ -1562,13 +1580,18 @@ export class RoomBattle extends RoomGame<RoomBattlePlayer> {
 		}
 
 		const buttons = validNodes.map(node => {
-			// Build a list of active mons from whatever sides the node has
+			const sideDefs = [
+				['p1Team', node.p1Name || 'P1'],
+				['p2Team', node.p2Name || 'P2'],
+				['p3Team', node.p3Name || 'P3'],
+				['p4Team', node.p4Name || 'P4'],
+			] as const;
 			const actives: string[] = [];
-			for (const key of ['p1Team', 'p2Team', 'p3Team', 'p4Team'] as const) {
-				const team = node[key];
+			for (const [key, name] of sideDefs) {
+				const team = (node as any)[key];
 				if (!team) continue;
 				const active = team.find((p: any) => p.isActive && !p.fainted);
-				actives.push(active?.name || '—');
+				actives.push(`${name}: ${active?.name || '—'}`);
 			}
 
 			const label = `Timeline #${node.timelineNum}, Turn ${node.turn} (${actives.join(' / ')})`;

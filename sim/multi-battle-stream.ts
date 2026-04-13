@@ -47,6 +47,10 @@ export interface TimelineNodeData {
 	p2SideConditions: SideConditionSnapshot[];
 	p3SideConditions?: SideConditionSnapshot[];  // NEW
 	p4SideConditions?: SideConditionSnapshot[];  // NEW
+	p1Name?: string;
+	p2Name?: string;
+	p3Name?: string;
+	p4Name?: string;
 	field: FieldSnapshot;
 }
 
@@ -790,7 +794,7 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 			if (!activePokemon || activePokemon.fainted || activePokemon.hp <= 0) {
 				console.log(`[TIMELINE DEBUG] Transfer cancelled for ${sideId}: Pokémon fainted`);
 				this.pushMessage('update',
-					`|-message|${sideId}'s transfer was cancelled — the Pokémon fainted!`);
+					`|-message|${this.sideName(sourceBattle, transfer.sideId)}'s transfer was cancelled — the Pokémon fainted!`);
 				continue;
 			}
 
@@ -981,8 +985,10 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 		this.captureSnapshot(branchGlobalId, sourceBattle, targetTurn);
 
 		// Announce
-		const sideList = [...transferringSides].join(' and ');
-		const coord = `Timeline ${targetGlobalId}, Turn ${targetTurn}`;
+		const sideList = [...transferringSides]
+			.map(s => this.sideName(sourceBattle, s))
+			.join(' and ');
+		const coord = `Timeline #${this.timelineRegistry.get(targetGlobalId)?.num ?? '?'}, Turn ${targetTurn}`;
 		this.pushMessage('update',
 			`|-message|${sideList}'s Pokémon transferred to ${coord}! Branch #${branchNum} created at turn ${targetTurn + 1}.`
 		);
@@ -1282,6 +1288,11 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 		return this.battle?.currentTimelineId || '';
 	}
 
+	/** Human-readable name for a side, falling back to the slot id. */
+	private sideName(battle: any, sideId: BattleSideID): string {
+		return battle?.[sideId]?.name || sideId;
+	}
+
 	override _write(chunk: string) {
 		this.turnJustResolved = false;
 
@@ -1520,6 +1531,12 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 		const allNodes: TimelineNodeData[] = [];
 		const emptyField: FieldSnapshot = { weather: null, terrain: null, pseudoWeather: [] };
 
+		const liveBattle = this.battle?.battle;
+		const names: Partial<Record<BattleSideID, string>> = {};
+		for (const s of (liveBattle?.sides ?? [])) {
+			if (s) names[s.id as BattleSideID] = s.name;
+		}
+
 		for (const [globalId, entry] of this.timelineRegistry) {
 			const battle = this.manager.getBattle(entry.battleId);
 			const history = this.turnSnapshots.get(globalId);
@@ -1560,6 +1577,8 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 					p1SideConditions: snap.sides.p1?.sideConditions ?? [],
 					p2SideConditions: snap.sides.p2?.sideConditions ?? [],
 					field: snap.field,
+					p1Name: names.p1,
+					p2Name: names.p2,
 				};
 				// Only attach p3/p4 if the snapshot has them — keeps 2-player
 				// payloads small and lets clients use `'p3Team' in node` to
@@ -1567,10 +1586,12 @@ export class MultiTimeBattleStream extends Streams.ObjectReadWriteStream<string>
 				if (snap.sides.p3) {
 					node.p3Team = snap.sides.p3.team.map(toClientSnapshot);
 					node.p3SideConditions = snap.sides.p3.sideConditions;
+					node.p3Name = names.p3;
 				}
 				if (snap.sides.p4) {
 					node.p4Team = snap.sides.p4.team.map(toClientSnapshot);
 					node.p4SideConditions = snap.sides.p4.sideConditions;
+					node.p4Name = names.p4;
 				}
 				allNodes.push(node);
 			}

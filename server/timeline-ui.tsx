@@ -95,6 +95,10 @@ export interface TimelineNodeData {
 	p4Team?: PokemonSnapshot[];
 	/** @deprecated */ p1Active?: PokemonSnapshot | null;
 	/** @deprecated */ p2Active?: PokemonSnapshot | null;
+	p1Name?: string;
+	p2Name?: string;
+	p3Name?: string;
+	p4Name?: string;
 }
 
 // ── Internal layout types ───────────────────────────────
@@ -155,15 +159,13 @@ interface Connection {
 function collectSides(d: TimelineNodeData, laneColor: string): SideBlock[] {
 	const out: SideBlock[] = [];
 
-	// p1/p2: always present; honor deprecated single-active fallback
 	const p1 = d.p1Team?.length ? d.p1Team : (d.p1Active ? [d.p1Active] : []);
 	const p2 = d.p2Team?.length ? d.p2Team : (d.p2Active ? [d.p2Active] : []);
-	out.push({label: 'P1', team: p1, color: laneColor});
-	out.push({label: 'P2', team: p2, color: SIDE_COLORS.p2});
+	out.push({label: d.p1Name || 'P1', team: p1, color: laneColor});
+	out.push({label: d.p2Name || 'P2', team: p2, color: SIDE_COLORS.p2});
 
-	// p3/p4: only when the server sent them (FFA/multi)
-	if (d.p3Team) out.push({label: 'P3', team: d.p3Team, color: SIDE_COLORS.p3});
-	if (d.p4Team) out.push({label: 'P4', team: d.p4Team, color: SIDE_COLORS.p4});
+	if (d.p3Team) out.push({label: d.p3Name || 'P3', team: d.p3Team, color: SIDE_COLORS.p3});
+	if (d.p4Team) out.push({label: d.p4Name || 'P4', team: d.p4Team, color: SIDE_COLORS.p4});
 
 	return out;
 }
@@ -423,7 +425,8 @@ function sideBlockHTML(team: PokemonSnapshot[], label: string, borderColor: stri
 		'margin:2px 4px;background:' + borderColor + '08;">' +
 		'<div style="font-size:8px;font-weight:bold;color:' + borderColor + ';' +
 		'padding:1px 5px;border-bottom:1px solid ' + borderColor + '30;' +
-		'background:' + borderColor + '14;border-radius:4px 4px 0 0;">' +
+		'background:' + borderColor + '14;border-radius:4px 4px 0 0;' +
+		'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' +
 		label + '</div>' +
 		rows +
 		'</div>';

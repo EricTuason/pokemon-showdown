@@ -512,6 +512,7 @@ export class RoomBattle extends RoomGame<RoomBattlePlayer> {
 	readonly ladder: string;
 	readonly gameType: string | undefined;
 	private timelineVizCreated = false;
+	lastTimelineData: { nodes: any[] } | null = null;
 	readonly challengeType: ChallengeType;
 	/**
 	 * The lower player's rating, for searching purposes.
@@ -865,12 +866,19 @@ export class RoomBattle extends RoomGame<RoomBattlePlayer> {
 				if (line.startsWith('|timenodes|')) {
 					try {
 						const json = JSON.parse(line.slice('|timenodes|'.length));
+
+						// Stash for the /view-timeline-<roomid> page handler. Only the
+						// most recent snapshot is kept — the page is read-only, not live.
+						this.lastTimelineData = json;
+
 						const html = generateTimelineHTML(json);
+						const popoutBar = this.buildTimelinePopoutBar();
+
 						// uhtml to create, uhtmlchange to update without scroll jump
 						const cmd = this.timelineVizCreated ? 'uhtmlchange' : 'uhtml';
-						this.room.add(`|${cmd}|timeline-viz|${html}`);
+						this.room.add(`|${cmd}|timeline-viz|${html}${popoutBar}`);
 						this.timelineVizCreated = true;
-						
+
 						// Add transfer UI below timeline (separate from visualization)
 						const transferUI = this.generateTransferUI(json.nodes);
 						this.room.add(`|uhtml|timeline-transfer|${transferUI}`);
@@ -1463,6 +1471,64 @@ export class RoomBattle extends RoomGame<RoomBattlePlayer> {
 		});
 		const result = await logPromise;
 		return result;
+	}
+
+	/**
+	 * Builds the "pop out timeline" bar shown under the in-chat timeline viz.
+	 *
+	 * Two affordances, both static HTML because Showdown's chat sanitizer
+	 * strips <script>, <iframe>, and data: hrefs:
+	 *
+	 *   1. A link to `/view-timeline-<roomid>`. Left-click opens it as a
+	 *      page-tab inside PS client; ctrl-click / middle-click bypasses
+	 *      the client's link interceptor and opens a real new browser
+	 *      window (which loads a fresh PS client instance and navigates to
+	 *      the same page).
+	 *
+	 *   2. A collapsible <details> containing the raw `|timenodes|` JSON.
+	 *      Users can select-all → copy, then paste into the standalone
+	 *      timeline-viewer HTML file for its interactive zoom / layout
+	 *      controls that the in-chat view can't expose.
+	 */
+	private buildTimelinePopoutBar(): string {
+		const clientDomain =
+			(Config.routes && (Config.routes as any).client) ||
+			'play.pokemonshowdown.com';
+		const viewUrl = `https://${clientDomain}/view-timeline-${this.roomid}`;
+
+		const rawJson = this.lastTimelineData
+			? Utils.escapeHTML(JSON.stringify(this.lastTimelineData, null, 2))
+			: '';
+
+		return (
+			'<div style="margin-top:6px;padding:6px 8px;border:1px solid #cfd8e6;' +
+			'border-radius:4px;background:#f3f6fb;font-family:Arial,Helvetica,sans-serif;' +
+			'font-size:11px;color:#333;">' +
+
+			'<div style="display:flex;justify-content:space-between;align-items:center;' +
+			'gap:8px;flex-wrap:wrap;">' +
+			'<span style="font-weight:bold;">Timeline:</span>' +
+			'<span>' +
+			`<a href="${viewUrl}" target="_blank" ` +
+			'style="display:inline-block;padding:3px 10px;background:#4a90e2;' +
+			'color:white;text-decoration:none;border-radius:3px;font-weight:bold;">' +
+			'Open in new tab \u2197</a> ' +
+			'<span style="color:#888;font-size:10px;">' +
+			'(ctrl / middle-click \u2192 separate browser window)</span>' +
+			'</span>' +
+			'</div>' +
+
+			'<details style="margin-top:6px;">' +
+			'<summary style="cursor:pointer;color:#4a4a88;outline:none;">' +
+			'Raw JSON (for the standalone timeline viewer)</summary>' +
+			'<textarea readonly spellcheck="false" ' +
+			'style="width:100%;height:100px;margin-top:4px;font-family:monospace;' +
+			'font-size:10px;background:#fff;border:1px solid #ccc;border-radius:3px;' +
+			`padding:4px;box-sizing:border-box;resize:vertical;">${rawJson}</textarea>` +
+			'</details>' +
+
+			'</div>'
+		);
 	}
 
 	/**
